@@ -1,0 +1,1096 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>勉強計画トラッカー</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#0a0e14;font-family:'Noto Sans JP','Hiragino Sans',sans-serif;-webkit-font-smoothing:antialiased;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useCallback,useMemo}=React;
+// ═══ Constants ═══
+const GS = "2026-03-23";
+const RAMP = 140;
+const B0 = 1, B1 = 50;
+const INCR = (B1 - B0) / (RAMP - 1);
+
+// ═══ Date utils (timezone-safe) ═══
+function toStr(d) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; }
+function parseD(s) { const [y,m,d]=s.split("-").map(Number); return new Date(y,m-1,d); }
+function today() { return toStr(new Date()); }
+function diffD(a,b) { return Math.round((parseD(b)-parseD(a))/86400000); }
+function addD(s,n) { const d=parseD(s); d.setDate(d.getDate()+n); return toStr(d); }
+function isWe(s) { const w=parseD(s).getDay(); return w===0||w===6; }
+function fF(s) { const d=parseD(s); return `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()}`; }
+function fS(s) { const d=parseD(s); return `${d.getMonth()+1}/${d.getDate()}`; }
+function dw(s) { return ["日","月","火","水","木","金","土"][parseD(s).getDay()]; }
+const gid=()=>Math.random().toString(36).slice(2,10);
+
+// ═══ Core calc ═══
+function dailyReq(date) {
+  const n=diffD(GS,date)+1; if(n<=0) return 0;
+  const base=n<=RAMP?B0+(n-1)*INCR:B1;
+  return isWe(date)?base*1.5:base;
+}
+function fieldReq(f,date) { if(!f.pct||date<f.startDate) return 0; return dailyReq(date)*(f.pct/100); }
+function bookEff(b) { return b.totalPages*(b.coeff||1); }
+function fieldEff(f) { return f.books.reduce((s,b)=>s+bookEff(b),0); }
+function fieldEnd(f) {
+  const tot=fieldEff(f); if(tot<=0||!f.pct) return null;
+  let cum=0,d=f.startDate;
+  for(let i=0;i<3650;i++){cum+=fieldReq(f,d);if(cum>=tot)return d;d=addD(d,1);}
+  return d;
+}
+function logsEff(f,logs) {
+  let t=0; Object.values(logs).forEach(arr=>{
+    if(!Array.isArray(arr))return;
+    arr.forEach(e=>{if(e.fid!==f.id)return;const b=f.books.find(x=>x.id===e.bid);if(b)t+=e.pg*(b.coeff||1);});
+  }); return t;
+}
+
+// ═══ Date-aware allocation analysis ═══
+function getAllocOnDate(fields, date) {
+  // Returns sum of pct of all fields active on this date (before their end)
+  let total = 0;
+  fields.forEach(f => {
+    if (date < f.startDate || !f.pct) return;
+    const end = fieldEnd(f);
+    if (end && date > end) return;
+    total += f.pct;
+  });
+  return total;
+}
+
+function findOverAllocDays(fields) {
+  // Scan from GS to furthest field end + 30 days
+  let maxEnd = GS;
+  fields.forEach(f => { const e = fieldEnd(f); if (e && e > maxEnd) maxEnd = e; });
+  const scanEnd = addD(maxEnd, 30);
+  const issues = [];
+  let d = GS;
+  while (d <= scanEnd) {
+    const alloc = getAllocOnDate(fields, d);
+    if (alloc > 100) issues.push({ date: d, pct: alloc });
+    d = addD(d, 1);
+    if (issues.length > 500) break;
+  }
+  return issues;
+}
+
+function findUnderAllocDays(fields) {
+  // Scan entire plan period (GS to latest field end)
+  let maxEnd = GS;
+  fields.forEach(f => { const e = fieldEnd(f); if (e && e > maxEnd) maxEnd = e; });
+  const scanEnd = addD(maxEnd, 7);
+  const issues = [];
+  let d = GS;
+  while (d <= scanEnd) {
+    const alloc = getAllocOnDate(fields, d);
+    if (alloc > 0 && alloc < 100 && dailyReq(d) > 0) issues.push({ date: d, pct: alloc });
+    d = addD(d, 1);
+    if (issues.length > 500) break;
+  }
+  return issues;
+}
+
+// Summarize date ranges for display
+function summarizeRanges(days) {
+  if (!days.length) return [];
+  const sorted = [...days].sort((a,b) => a.date.localeCompare(b.date));
+  const ranges = [];
+  let start = sorted[0], prev = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    if (diffD(prev.date, sorted[i].date) === 1 && Math.abs(sorted[i].pct - prev.pct) < 1) {
+      prev = sorted[i];
+    } else {
+      ranges.push({ from: start.date, to: prev.date, pct: start.pct });
+      start = sorted[i]; prev = sorted[i];
+    }
+  }
+  ranges.push({ from: start.date, to: prev.date, pct: start.pct });
+  return ranges.slice(0, 10);
+}
+
+// ═══ Storage ═══
+const SK="study-v6";
+const GAS_URL="https://script.google.com/macros/s/AKfycby-m8wolLReolMnjWXvaOJQzz-ZkSyN1MM0zzugWL1SBoCgceU7eEwXjaUcq6-XIY5W/exec";
+const API_KEY="kano_study_2026_secret"; // GAS側と同じキー
+
+// Local storage
+function loadLocal(){try{const r=localStorage.getItem(SK);return r?JSON.parse(r):null;}catch{return null;}}
+function saveLocal(d){try{localStorage.setItem(SK,JSON.stringify(d));}catch{}}
+
+// Cloud load: fetch with API key
+async function loadCloud(){
+  // Method 1: fetch GAS with key
+  try{
+    const res=await fetch(GAS_URL+"?key="+encodeURIComponent(API_KEY));
+    if(res.ok){const d=await res.json();if(d&&d.fields)return d;}
+  }catch{}
+  // Method 2: JSONP with key
+  return new Promise((resolve)=>{
+    const cb="_gcb"+Date.now();
+    const timer=setTimeout(()=>{delete window[cb];resolve(null);},8000);
+    window[cb]=(data)=>{
+      clearTimeout(timer);delete window[cb];
+      try{if(typeof data==="string")data=JSON.parse(data);resolve(data&&data.fields?data:null);}catch{resolve(null);}
+    };
+    const s=document.createElement("script");
+    s.src=GAS_URL+"?key="+encodeURIComponent(API_KEY)+"&callback="+cb;
+    s.onerror=()=>{clearTimeout(timer);delete window[cb];resolve(null);};
+    document.head.appendChild(s);
+    s.addEventListener("load",()=>{try{document.head.removeChild(s);}catch{}});
+  });
+}
+
+// Cloud save: fetch POST with key, fallback to form POST
+async function saveCloud(d){
+  const json=JSON.stringify(d);
+  // Method 1: fetch POST
+  try{
+    const res=await fetch(GAS_URL+"?key="+encodeURIComponent(API_KEY),{method:"POST",body:json,headers:{"Content-Type":"text/plain"}});
+    if(res.ok){const r=await res.json();if(r&&r.success)return true;}
+  }catch{}
+  // Method 2: form POST with key in hidden field
+  return new Promise((resolve)=>{
+    try{
+      const fn="gsf"+Date.now();
+      const ifr=document.createElement("iframe");
+      ifr.name=fn;ifr.style.cssText="display:none;";
+      document.body.appendChild(ifr);
+      let done=false;
+      const onMsg=(ev)=>{if(ev.data==="gas_save_ok"){done=true;fin(true);}if(ev.data==="gas_save_error"){done=true;fin(false);}};
+      window.addEventListener("message",onMsg);
+      const fin=(ok)=>{window.removeEventListener("message",onMsg);setTimeout(()=>{try{document.body.removeChild(frm);}catch{}try{document.body.removeChild(ifr);}catch{}},500);resolve(ok);};
+      const frm=document.createElement("form");
+      frm.method="POST";frm.action=GAS_URL;frm.target=fn;
+      const keyInp=document.createElement("input");
+      keyInp.type="hidden";keyInp.name="key";keyInp.value=API_KEY;
+      frm.appendChild(keyInp);
+      const dataInp=document.createElement("input");
+      dataInp.type="hidden";dataInp.name="data";dataInp.value=json;
+      frm.appendChild(dataInp);document.body.appendChild(frm);frm.submit();
+      setTimeout(()=>{if(!done)fin(true);},6000);
+    }catch{resolve(false);}
+  });
+}
+
+// Combined: cloud first, then local
+async function load(){
+  const cloud=await loadCloud();
+  if(cloud){saveLocal(cloud);return cloud;}
+  return await loadLocal();
+}
+async function save(d){saveLocal(d);saveCloud(d);}
+
+const DEF={fields:[],logs:{}};
+
+// ═══ Styles ═══
+const card={background:"linear-gradient(135deg,#0f1419,#1a1f2e)",borderRadius:16,padding:"18px 22px",border:"1px solid rgba(255,255,255,0.06)",marginBottom:16};
+const inp={width:"100%",background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,padding:"8px 12px",color:"#fff",fontSize:13,outline:"none",boxSizing:"border-box"};
+const lb={color:"rgba(255,255,255,0.45)",fontSize:11,display:"block",marginBottom:4};
+const CL=["#4ade80","#818cf8","#f87171","#fbbf24","#22d3ee","#e879f9","#fb923c","#a3e635"];
+function fmtRange(w){if(w<4)return`${w}週間`;const m=Math.round(w/4.33);if(m<12)return`約${m}ヶ月`;return`約${(w/52).toFixed(1)}年`;}
+
+// ═══ SVG: Stacked Bar Chart ═══
+function StackedChart({ days: rawDays, fields, w=540, h=220, showCapLine=false, title, legend }) {
+  if (!rawDays.length) return null;
+  // Downsample if too many points
+  let days = rawDays;
+  if (rawDays.length > 120) {
+    const bs = Math.ceil(rawDays.length / 120);
+    days = [];
+    for (let i = 0; i < rawDays.length; i += bs) {
+      const chunk = rawDays.slice(i, i + bs);
+      const avgSegs = chunk[0].segments.map((seg, si) => ({
+        ...seg, val: chunk.reduce((s, d) => s + (d.segments[si]?.val || 0), 0) / chunk.length
+      }));
+      const avgCap = chunk.reduce((s, d) => s + (d.cap || 0), 0) / chunk.length;
+      const hasToday = chunk.some(d => d.d === today());
+      days.push({ ...chunk[0], segments: avgSegs, cap: avgCap, total: avgSegs.reduce((s, x) => s + x.val, 0), d: chunk[0].d, lbl: chunk[0].lbl });
+      if (hasToday) days[days.length - 1].d = today();
+    }
+  }
+  let maxY = 0.1;
+  for (let i = 0; i < days.length; i++) { const v = Math.max(days[i].total || 0, days[i].cap || 0); if (v > maxY) maxY = v; }
+  maxY *= 1.1;
+  const pad={t:20,b:32,l:44,r:10};
+  const pw=w-pad.l-pad.r, ph=h-pad.t-pad.b;
+  const n=days.length;
+  const barSlot=pw/n;
+  const barW=Math.max(1,Math.min(14,barSlot*0.7));
+  const xC=(i)=>pad.l+(i+0.5)*barSlot;
+  const yS=(v)=>pad.t+ph-(v/maxY)*ph;
+  const todayIdx=days.findIndex(d=>d.d===today());
+  const labelStep=Math.max(1,Math.floor(n/14));
+  const yTicks=5; const yStep=maxY/yTicks;
+
+  // Capacity line path
+  let capPath="";
+  if(showCapLine){
+    days.forEach((d,i)=>{
+      if(d.cap===undefined)return;
+      capPath+=(i===0?"M":"L")+`${xC(i)},${yS(d.cap)}`;
+    });
+  }
+
+  return (
+    <div style={{...card,padding:"14px 6px 6px"}}>
+      {title && <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:4,padding:"0 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span>{title}</span>
+        {legend && <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{legend}</div>}
+      </div>}
+      <svg viewBox={`0 0 ${w} ${h}`} style={{width:"100%",height:"auto",display:"block"}}>
+        {/* Grid + Y labels */}
+        {Array.from({length:yTicks+1},(_,i)=>{
+          const v=Math.round(yStep*i);
+          return <g key={i}><line x1={pad.l} x2={w-pad.r} y1={yS(v)} y2={yS(v)} stroke="rgba(255,255,255,0.04)"/>
+            <text x={pad.l-5} y={yS(v)+3} fill="rgba(255,255,255,0.25)" fontSize="9" textAnchor="end">{v}</text></g>;
+        })}
+        {/* Today highlight */}
+        {todayIdx>=0 && <rect x={pad.l+todayIdx*barSlot} y={pad.t} width={barSlot} height={ph} fill="rgba(251,191,36,0.06)"/>}
+        {/* Stacked bars */}
+        {days.map((day,i)=>{
+          let cumH=0;
+          return <g key={i}>{day.segments.map((seg,si)=>{
+            const segH=(seg.val/maxY)*ph;
+            const y=yS(0)-cumH-segH;
+            cumH+=segH;
+            if(seg.val<=0) return null;
+            return seg.dashed
+              ? <rect key={si} x={xC(i)-barW/2} y={y} width={barW} height={Math.max(segH,0.5)} rx={1}
+                  fill={seg.color} opacity={0.25} stroke={seg.color} strokeWidth="1" strokeDasharray="3 2"/>
+              : <rect key={si} x={xC(i)-barW/2} y={y} width={barW} height={Math.max(segH,0.5)} rx={1}
+                  fill={seg.color} opacity={0.75}/>;
+          })}</g>;
+        })}
+        {/* Capacity line */}
+        {showCapLine && capPath && <path d={capPath} fill="none" stroke="rgba(255,255,255,0.35)" strokeWidth="1.5" strokeDasharray="5 3"/>}
+        {/* Today line */}
+        {todayIdx>=0 && <>
+          <line x1={xC(todayIdx)} x2={xC(todayIdx)} y1={pad.t-4} y2={pad.t+ph+2} stroke="#fbbf24" strokeWidth="1.5" strokeDasharray="3 3"/>
+          <text x={xC(todayIdx)} y={pad.t-6} fill="#fbbf24" fontSize="9" textAnchor="middle" fontWeight="600">今日</text>
+        </>}
+        {/* X labels */}
+        {days.map((d,i)=>{
+          if(i%labelStep!==0&&i!==todayIdx)return null;
+          return <text key={i} x={xC(i)} y={h-6} fill={i===todayIdx?"#fbbf24":"rgba(255,255,255,0.25)"} fontSize="8" textAnchor="middle" fontWeight={i===todayIdx?"600":"400"}>{d.lbl}</text>;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// ═══ SVG: Plan vs Actual daily bars ═══
+function DailyCompareChart({ data: rawData, w=540, h=220 }) {
+  if (!rawData.length) return null;
+  // Downsample if too many points: aggregate into buckets
+  let data = rawData;
+  if (rawData.length > 120) {
+    const bucketSize = Math.ceil(rawData.length / 120);
+    data = [];
+    for (let i = 0; i < rawData.length; i += bucketSize) {
+      const chunk = rawData.slice(i, i + bucketSize);
+      const avgPlan = chunk.reduce((s, d) => s + d.plan, 0) / chunk.length;
+      const pastChunk = chunk.filter(d => d.actual !== null);
+      const avgActual = pastChunk.length > 0 ? pastChunk.reduce((s, d) => s + d.actual, 0) / pastChunk.length : null;
+      const hasToday = chunk.some(d => d.isToday);
+      data.push({ d: chunk[0].d, lbl: chunk[0].lbl, plan: avgPlan, actual: avgActual, isToday: hasToday });
+    }
+  }
+  let maxY = 0.1;
+  for (let i = 0; i < data.length; i++) { const v = Math.max(data[i].plan, data[i].actual ?? 0); if (v > maxY) maxY = v; }
+  maxY *= 1.1;
+  const pad={t:20,b:32,l:44,r:10};
+  const pw=w-pad.l-pad.r, ph=h-pad.t-pad.b;
+  const n=data.length;
+  const barSlot=pw/n;
+  const barW=Math.max(1,Math.min(12,barSlot*0.35));
+  const gap=Math.max(0.5,barW*0.15);
+  const xC=(i)=>pad.l+(i+0.5)*barSlot;
+  const yS=(v)=>pad.t+ph-(v/maxY)*ph;
+  const todayIdx=data.findIndex(d=>d.isToday);
+  const labelStep=Math.max(1,Math.floor(n/14));
+  const yTicks=5;const yStep=maxY/yTicks;
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} style={{width:"100%",height:"auto",display:"block"}}>
+      {Array.from({length:yTicks+1},(_,i)=>{
+        const v=Math.round(yStep*i);
+        return <g key={i}><line x1={pad.l} x2={w-pad.r} y1={yS(v)} y2={yS(v)} stroke="rgba(255,255,255,0.04)"/>
+          <text x={pad.l-5} y={yS(v)+3} fill="rgba(255,255,255,0.25)" fontSize="9" textAnchor="end">{v}</text></g>;
+      })}
+      {todayIdx>=0&&<rect x={pad.l+todayIdx*barSlot} y={pad.t} width={barSlot} height={ph} fill="rgba(251,191,36,0.06)"/>}
+      {data.map((d,i)=>{
+        const cx=xC(i);
+        const planH=(d.plan/maxY)*ph;
+        const actH=d.actual!==null?(d.actual/maxY)*ph:0;
+        return <g key={i}>
+          <rect x={cx-barW-gap/2} y={yS(d.plan)} width={barW} height={Math.max(planH,0.5)} rx={1} fill="rgba(255,255,255,0.15)"/>
+          {d.actual!==null&&<rect x={cx+gap/2} y={yS(d.actual)} width={barW} height={Math.max(actH,0.5)} rx={1} fill={d.actual>=d.plan?"#4ade80":"#f87171"} opacity={0.8}/>}
+        </g>;
+      })}
+      {todayIdx>=0&&<>
+        <line x1={xC(todayIdx)} x2={xC(todayIdx)} y1={pad.t-4} y2={pad.t+ph+2} stroke="#fbbf24" strokeWidth="1.5" strokeDasharray="3 3"/>
+        <text x={xC(todayIdx)} y={pad.t-6} fill="#fbbf24" fontSize="9" textAnchor="middle" fontWeight="600">今日</text>
+      </>}
+      {data.map((d,i)=>{
+        if(i%labelStep!==0&&i!==todayIdx)return null;
+        return <text key={i} x={xC(i)} y={h-6} fill={i===todayIdx?"#fbbf24":"rgba(255,255,255,0.25)"} fontSize="8" textAnchor="middle" fontWeight={i===todayIdx?"600":"400"}>{d.lbl}</text>;
+      })}
+    </svg>
+  );
+}
+
+// ═══ Build chart data helpers ═══
+function buildDailyCompare(state, ff, halfWeeks) {
+  const { fields, logs } = state;
+  const t=today(); const halfDays=halfWeeks*7;
+  // Always keep today centered - don't clamp to GS
+  const startD=addD(t,-halfDays), endD=addD(t,halfDays);
+  const totalDays=diffD(startD,endD)+1;
+  if (totalDays <= 0) return [];
+  const af=ff?fields.filter(f=>f.id===ff):fields;
+  const out=[];
+  for(let i=0;i<totalDays;i++){
+    const d=addD(startD,i);
+    // Plan = full 100% daily requirement (not limited to field allocation)
+    const dp = d >= GS ? dailyReq(d) : 0;
+    let da=0;
+    const ents=Array.isArray(logs[d])?logs[d]:[];
+    ents.forEach(e=>{const f=fields.find(x=>x.id===e.fid);if(!f||(ff&&f.id!==ff))return;const b=f.books.find(x=>x.id===e.bid);if(b)da+=e.pg*(b.coeff||1);});
+    const hasData=d<=t||ents.length>0;
+    out.push({d,lbl:fS(d),plan:Math.round(dp*10)/10,actual:hasData?Math.round(da*10)/10:null,isToday:d===t});
+  }
+  return out;
+}
+
+function buildPlanActualChart(state, halfWeeks) {
+  const { fields, logs } = state;
+  const t=today(); const halfDays=halfWeeks*7;
+  // Keep today centered
+  const startD=addD(t,-halfDays), endD=addD(t,halfDays);
+  const totalDays=diffD(startD,endD)+1;
+  if (totalDays <= 0) return [];
+  const endMap=new Map();
+  fields.forEach(f=>{endMap.set(f.id, fieldEnd(f));});
+  const out=[];
+  for(let i=0;i<totalDays;i++){
+    const d=addD(startD,i);
+    const ents=Array.isArray(logs[d])?logs[d]:[];
+    const hasLog=ents.length>0;
+    const isFuture=d>t && !hasLog;
+
+    const segments=[];
+    if(isFuture){
+      fields.forEach((f,fi)=>{
+        const end=endMap.get(f.id);
+        let val=0;
+        if(d>=f.startDate && f.pct && (!end||d<=end)) val=fieldReq(f,d);
+        segments.push({fid:f.id,val,color:CL[fi%CL.length],dashed:true});
+      });
+    } else {
+      fields.forEach((f,fi)=>{
+        let val=0;
+        ents.forEach(e=>{
+          if(e.fid!==f.id) return;
+          const b=f.books.find(x=>x.id===e.bid);
+          if(b) val+=e.pg*(b.coeff||1);
+        });
+        segments.push({fid:f.id,val,color:CL[fi%CL.length],dashed:false});
+      });
+    }
+    const cap=dailyReq(d);
+    out.push({d,lbl:fS(d),cap,segments,total:segments.reduce((s,x)=>s+x.val,0)});
+  }
+  return out;
+}
+
+function calcCum(state, ff) {
+  const {fields,logs}=state; const t=today();
+  const af=ff?fields.filter(f=>f.id===ff):fields;
+  let cumP=0,cumA=0;
+  let latestLog=t;
+  Object.keys(logs).forEach(d=>{if(d>latestLog&&Array.isArray(logs[d])&&logs[d].length>0)latestLog=d;});
+  const endDate=latestLog>t?latestLog:t;
+  const totalDays=diffD(GS,endDate)+1;
+  if(totalDays<=0) return {pageDiff:0,daysDiff:0,cumPlan:0,cumActual:0};
+  for(let i=0;i<totalDays;i++){
+    const d=addD(GS,i);
+    let dp=0; af.forEach(f=>{if(d<f.startDate)return;dp+=fieldReq(f,d);}); cumP+=dp;
+    let da=0; const ents=Array.isArray(logs[d])?logs[d]:[];
+    ents.forEach(e=>{const f=fields.find(x=>x.id===e.fid);if(!f||(ff&&f.id!==ff))return;const b=f.books.find(x=>x.id===e.bid);if(b)da+=e.pg*(b.coeff||1);});
+    cumA+=da;
+  }
+  const pageDiff=cumA-cumP;
+  const todayReq=af.reduce((s,f)=>s+fieldReq(f,t),0);
+  const daysDiff=todayReq>0?pageDiff/todayReq:0;
+  return {pageDiff:Math.round(pageDiff*10)/10,daysDiff:Math.round(daysDiff*10)/10,cumPlan:Math.round(cumP),cumActual:Math.round(cumA)};
+}
+
+// ═══ Tab 1: Plan ═══
+function PlanTab({state,persist}) {
+  const [ed,setEd]=useState(null);
+  const [bt,setBt]=useState("");const [bp,setBp]=useState("");const [bc,setBc]=useState("1.0");
+
+  function openNew(){setBt("");setBp("");setBc("1.0");setEd({id:gid(),name:"",cat:"other",pct:"",startDate:GS,books:[]});}
+  function openEdit(f){setBt("");setBp("");setBc("1.0");setEd(JSON.parse(JSON.stringify(f)));}
+  function addBook(){const p=parseInt(bp);if(!bt||!p||p<=0)return;setEd(prev=>({...prev,books:[...prev.books,{id:gid(),title:bt,totalPages:p,coeff:parseFloat(bc)||1,pagesRead:0}]}));setBt("");setBp("");setBc("1.0");}
+  function removeBook(bid){setEd(prev=>({...prev,books:prev.books.filter(b=>b.id!==bid)}));}
+  function saveField(){
+    if(!ed||!ed.name||!ed.pct||ed.books.length===0)return;
+    const pn=parseFloat(ed.pct);if(!pn||pn<=0)return;
+    const f={...ed,pct:pn};
+    const idx=state.fields.findIndex(x=>x.id===f.id);
+    persist({...state,fields:idx>=0?state.fields.map(x=>x.id===f.id?f:x):[...state.fields,f]});
+    setEd(null);
+  }
+
+  // Date-aware analysis
+  const overDays = useMemo(()=>findOverAllocDays(state.fields),[state.fields]);
+  const underDays = useMemo(()=>findUnderAllocDays(state.fields),[state.fields]);
+  const underSoon = useMemo(()=>{
+    const t=today(); const weekEnd=addD(t,7);
+    return underDays.filter(d=>d.date>=t && d.date<=weekEnd);
+  },[underDays]);
+  const underLater = useMemo(()=>{
+    const weekEnd=addD(today(),7);
+    return underDays.filter(d=>d.date>weekEnd);
+  },[underDays]);
+  const overRanges = useMemo(()=>summarizeRanges(overDays),[overDays]);
+  const underSoonRanges = useMemo(()=>summarizeRanges(underSoon),[underSoon]);
+  const underLaterRanges = useMemo(()=>summarizeRanges(underLater),[underLater]);
+  const todayAlloc = useMemo(()=>getAllocOnDate(state.fields, today()),[state.fields]);
+
+  const previewEnd = useMemo(()=>{
+    if(!ed||ed.books.length===0||!ed.pct)return null;
+    const pn=parseFloat(ed.pct);if(!pn||pn<=0)return null;
+    return fieldEnd({...ed,pct:pn});
+  },[ed]);
+  const previewEff=ed?ed.books.reduce((s,b)=>s+bookEff(b),0):0;
+
+  return (
+    <div>
+      <div style={card}>
+        <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600,marginBottom:8}}>📋 基本設定</div>
+        <div style={{color:"rgba(255,255,255,0.35)",fontSize:12,lineHeight:1.8}}>
+          開始: <span style={{color:"#fbbf24"}}>{fF(GS)}(月)</span>　初日1p→20週で定着（平日50p/休日75p）<br/>
+          毎日+{INCR.toFixed(3)}p（休日×1.5）　バッファなし<br/>
+          <span style={{color:"rgba(255,255,255,0.2)"}}>※ 1実質page≈4分。実page×係数＝実質page。</span>
+        </div>
+      </div>
+
+      <div style={card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>今日 {fF(today())}({dw(today())}) のノルマ</span>
+          <span style={{color:"#fbbf24",fontSize:20,fontWeight:700}}>{dailyReq(today()).toFixed(1)}<span style={{fontSize:12,fontWeight:400}}> 実質p</span></span>
+        </div>
+        <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:4,textAlign:"right"}}>
+          今日の割当: <span style={{color:todayAlloc===100?"#4ade80":todayAlloc>100?"#f87171":"#fbbf24",fontWeight:600}}>{todayAlloc}%</span>
+        </div>
+      </div>
+
+      {/* ── Warnings ── */}
+      {overDays.length>0 && (
+        <div style={{...card,borderColor:"rgba(248,113,113,0.3)",background:"linear-gradient(135deg,#1f1419,#1a1f2e)"}}>
+          <div style={{color:"#f87171",fontSize:13,fontWeight:600,marginBottom:6}}>⚠️ 100%超過の日があります</div>
+          <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.8}}>
+            {overRanges.map((r,i)=>(
+              <div key={i}>
+                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#f87171",fontWeight:600}}>{r.pct}%</span>
+              </div>
+            ))}
+            {overDays.length>10 && <div style={{color:"rgba(255,255,255,0.2)"}}>…他{overDays.length-10}日</div>}
+          </div>
+        </div>
+      )}
+
+      {underSoon.length>0 && state.fields.length>0 && (
+        <div style={{...card,borderColor:"rgba(248,113,113,0.3)",background:"linear-gradient(135deg,#1f1419,#1a1f2e)"}}>
+          <div style={{color:"#f87171",fontSize:13,fontWeight:600,marginBottom:6}}>🚨 1週間以内に100%未満の日があります</div>
+          <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.8}}>
+            {underSoonRanges.map((r,i)=>(
+              <div key={i}>
+                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#f87171",fontWeight:600}}>{r.pct}%</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {underLater.length>0 && state.fields.length>0 && (
+        <div style={{...card,borderColor:"rgba(251,191,36,0.3)",background:"linear-gradient(135deg,#1f1a14,#1a1f2e)"}}>
+          <div style={{color:"#fbbf24",fontSize:13,fontWeight:600,marginBottom:6}}>📢 100%未満の日があります</div>
+          <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.8}}>
+            {underLaterRanges.map((r,i)=>(
+              <div key={i}>
+                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#fbbf24",fontWeight:600}}>{r.pct}%</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Field list ── */}
+      <div style={card}>
+        <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600,marginBottom:8}}>分野一覧</div>
+        {state.fields.map((f,i)=>{
+          const te=fieldEff(f);const end=fieldEnd(f);const ae=logsEff(f,state.logs);
+          const pct=te>0?Math.min(ae/te*100,100):0;
+          return (
+            <div key={f.id} style={{background:"rgba(255,255,255,0.03)",borderRadius:12,padding:"12px 16px",marginBottom:8,border:`1px solid ${CL[i%CL.length]}22`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <div style={{width:8,height:8,borderRadius:"50%",background:CL[i%CL.length]}}/>
+                    <span style={{color:"#fff",fontWeight:600,fontSize:14}}>{f.name}</span>
+                    <span style={{color:CL[i%CL.length],fontSize:12,fontWeight:700}}>{f.pct}%</span>
+                  </div>
+                  <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:3,marginLeft:16}}>
+                    {fF(f.startDate)}〜{end?fF(end):""} · {f.books.length}冊 · 実質{te.toFixed(0)}p
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  <button onClick={()=>openEdit(f)} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer"}}>編集</button>
+                  <button onClick={()=>persist({...state,fields:state.fields.filter(x=>x.id!==f.id)})} style={{background:"rgba(248,113,113,0.1)",color:"#f87171",border:"none",borderRadius:8,padding:"6px 8px",fontSize:12,cursor:"pointer"}}>×</button>
+                </div>
+              </div>
+              <div style={{marginTop:6,marginLeft:16}}>
+                {f.books.map(b=>(
+                  <div key={b.id} style={{display:"flex",justifyContent:"space-between",padding:"2px 0"}}>
+                    <span style={{color:"rgba(255,255,255,0.55)",fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1}}>{b.title}</span>
+                    <span style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginLeft:8,whiteSpace:"nowrap"}}>{b.totalPages}p×{b.coeff}={bookEff(b).toFixed(0)}実質p</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginTop:6}}>
+                <div style={{flex:1,background:"rgba(255,255,255,0.06)",borderRadius:4,height:4,overflow:"hidden"}}>
+                  <div style={{width:`${pct}%`,height:"100%",background:CL[i%CL.length],borderRadius:4}}/>
+                </div>
+                <span style={{color:"rgba(255,255,255,0.4)",fontSize:11}}>{pct.toFixed(0)}%</span>
+              </div>
+            </div>
+          );
+        })}
+        <button onClick={openNew} style={{width:"100%",background:"rgba(255,255,255,0.04)",color:"rgba(255,255,255,0.4)",border:"1px dashed rgba(255,255,255,0.12)",borderRadius:12,padding:14,fontSize:13,cursor:"pointer",marginTop:8}}>+ 分野を追加</button>
+      </div>
+
+      {/* ── Edit modal ── */}
+      {ed&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
+          <div style={{background:"#1a1f2e",borderRadius:20,padding:24,maxWidth:460,width:"100%",border:"1px solid rgba(255,255,255,0.1)",maxHeight:"88vh",overflow:"auto"}}>
+            <h3 style={{color:"#fff",fontSize:17,fontWeight:700,margin:"0 0 14px"}}>{state.fields.some(x=>x.id===ed.id)?"分野を編集":"新しい分野"}</h3>
+            <div style={{display:"flex",gap:8,marginBottom:8}}>
+              <div style={{flex:2}}><label style={lb}>分野名</label><input value={ed.name} onChange={e=>setEd({...ed,name:e.target.value})} placeholder="例: 投資" style={inp}/></div>
+              <div style={{flex:1}}><label style={lb}>カテゴリ</label><select value={ed.cat} onChange={e=>setEd({...ed,cat:e.target.value})} style={{...inp,padding:8}}><option value="work">仕事</option><option value="other">その他</option></select></div>
+            </div>
+            <div style={{display:"flex",gap:8,marginBottom:10}}>
+              <div style={{flex:1}}><label style={lb}>割合(%)</label><input type="number" value={ed.pct} onChange={e=>setEd({...ed,pct:e.target.value})} placeholder="30" style={{...inp,fontSize:16,fontWeight:700}}/></div>
+              <div style={{flex:1}}><label style={lb}>開始日</label><input type="date" value={ed.startDate} onChange={e=>setEd({...ed,startDate:e.target.value})} style={inp}/></div>
+            </div>
+            {previewEnd&&(
+              <div style={{background:"rgba(251,191,36,0.08)",borderRadius:10,padding:"10px 14px",marginBottom:14,border:"1px solid rgba(251,191,36,0.1)"}}>
+                <div style={{display:"flex",justifyContent:"space-between"}}><span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>📅 完了予定</span><span style={{color:"#fbbf24",fontSize:14,fontWeight:700}}>{fF(previewEnd)}</span></div>
+                <div style={{color:"rgba(255,255,255,0.2)",fontSize:10,marginTop:4}}>実質{previewEff.toFixed(0)}p · 全体の{ed.pct}% · 約{diffD(ed.startDate,previewEnd)}日</div>
+              </div>
+            )}
+            <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:6}}>📚 本一覧</div>
+            {ed.books.map(b=>(
+              <div key={b.id} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 10px",background:"rgba(255,255,255,0.03)",borderRadius:6,marginBottom:3}}>
+                <span style={{color:"rgba(255,255,255,0.7)",fontSize:12,flex:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{b.title}</span>
+                <span style={{color:"rgba(255,255,255,0.3)",fontSize:11}}>{b.totalPages}p</span>
+                <span style={{color:"rgba(255,255,255,0.2)",fontSize:11}}>×{b.coeff}</span>
+                <span style={{color:"#fbbf24",fontSize:11}}>={bookEff(b).toFixed(0)}</span>
+                <button onClick={()=>removeBook(b.id)} style={{background:"none",border:"none",color:"rgba(255,255,255,0.2)",cursor:"pointer",fontSize:14,padding:"0 4px"}}>×</button>
+              </div>
+            ))}
+            {ed.books.length===0&&<div style={{padding:10,color:"rgba(255,255,255,0.2)",fontSize:12,textAlign:"center"}}>本を追加してください</div>}
+            <div style={{display:"flex",gap:6,marginTop:8,marginBottom:4,flexWrap:"wrap"}}>
+              <input value={bt} onChange={e=>setBt(e.target.value)} placeholder="タイトル" onKeyDown={e=>{if(e.key==="Enter")addBook();}} style={{...inp,flex:"3 1 120px"}}/>
+              <input type="number" value={bp} onChange={e=>setBp(e.target.value)} placeholder="p数" onKeyDown={e=>{if(e.key==="Enter")addBook();}} style={{...inp,flex:"1 1 55px"}}/>
+              <input type="number" step="0.1" value={bc} onChange={e=>setBc(e.target.value)} placeholder="係数" style={{...inp,flex:"1 1 45px"}}/>
+              <button onClick={addBook} style={{background:"rgba(74,222,128,0.15)",color:"#4ade80",border:"none",borderRadius:8,padding:"8px 12px",fontSize:13,cursor:"pointer"}}>+</button>
+            </div>
+            <div style={{color:"rgba(255,255,255,0.2)",fontSize:10,marginBottom:14}}>係数: 情報量が多い本→大(例:2.0), 軽い→小(例:0.5)。1実質page≈4分。</div>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={()=>setEd(null)} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13}}>キャンセル</button>
+              <button onClick={saveField} style={{flex:1,background:"#fbbf24",color:"#000",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13,fontWeight:700}}>保存</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══ Tab 2: Chart ═══
+function ChartTab({state}) {
+  const [ff,setFf]=useState(null);
+  const [hw,setHw]=useState(4);
+
+  const compareData=useMemo(()=>buildDailyCompare(state,ff,hw),[state,ff,hw]);
+  const paData=useMemo(()=>buildPlanActualChart(state,hw),[state,hw]);
+  const cum=useMemo(()=>calcCum(state,ff),[state,ff]);
+  const sur=cum.pageDiff>=0;
+  const tw=hw*2;
+
+  const fieldLegend=state.fields.map((f,i)=>(
+    <div key={f.id} style={{display:"flex",alignItems:"center",gap:3}}>
+      <div style={{width:8,height:8,borderRadius:2,background:CL[i%CL.length]}}/>
+      <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>{f.name}</span>
+    </div>
+  ));
+
+  return (
+    <div>
+      <div style={card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600}}>📊 計画表示</span>
+          <select value={ff||""} onChange={e=>setFf(e.target.value||null)} style={{...inp,width:"auto",padding:"4px 8px",fontSize:12}}>
+            <option value="">全分野</option>
+            {state.fields.map(f=><option key={f.id} value={f.id}>{f.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* Cumulative */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:16}}>
+        <div style={{...card,textAlign:"center",marginBottom:0,padding:14}}>
+          <div style={{color:"rgba(255,255,255,0.35)",fontSize:10,marginBottom:2}}>累積{sur?"余剰":"不足"}</div>
+          <div style={{color:sur?"#4ade80":"#f87171",fontSize:24,fontWeight:700}}>{sur?"+":""}{cum.pageDiff}</div>
+          <div style={{color:"rgba(255,255,255,0.2)",fontSize:10}}>実質ページ</div>
+        </div>
+        <div style={{...card,textAlign:"center",marginBottom:0,padding:14}}>
+          <div style={{color:"rgba(255,255,255,0.35)",fontSize:10,marginBottom:2}}>日数換算</div>
+          <div style={{color:sur?"#4ade80":"#f87171",fontSize:24,fontWeight:700}}>{sur?"+":""}{cum.daysDiff}</div>
+          <div style={{color:"rgba(255,255,255,0.2)",fontSize:10}}>日分の{sur?"余剰":"遅れ"}</div>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:16}}>
+        <div style={{...card,textAlign:"center",marginBottom:0,padding:10}}>
+          <div style={{color:"rgba(255,255,255,0.3)",fontSize:10}}>計画累計</div>
+          <div style={{color:"rgba(255,255,255,0.6)",fontSize:16,fontWeight:700}}>{cum.cumPlan}<span style={{fontSize:10,fontWeight:400}}> 実質p</span></div>
+        </div>
+        <div style={{...card,textAlign:"center",marginBottom:0,padding:10}}>
+          <div style={{color:"rgba(255,255,255,0.3)",fontSize:10}}>実績累計</div>
+          <div style={{color:"#818cf8",fontSize:16,fontWeight:700}}>{cum.cumActual}<span style={{fontSize:10,fontWeight:400}}> 実質p</span></div>
+        </div>
+      </div>
+
+      {/* Range slider */}
+      <div style={{...card,padding:"14px 22px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <span style={{color:"rgba(255,255,255,0.45)",fontSize:11}}>表示範囲</span>
+          <span style={{color:"#fbbf24",fontSize:12,fontWeight:600}}>±{fmtRange(hw)}（計{fmtRange(tw)}）</span>
+        </div>
+        <input type="range" min={1} max={260} step={1} value={hw} onChange={e=>setHw(parseInt(e.target.value))} style={{width:"100%",accentColor:"#fbbf24"}}/>
+        <div style={{display:"flex",justifyContent:"space-between",marginTop:4}}>
+          <span style={{color:"rgba(255,255,255,0.15)",fontSize:9}}>±1週</span>
+          <span style={{color:"rgba(255,255,255,0.15)",fontSize:9}}>±5年</span>
+        </div>
+      </div>
+
+      {/* Chart 1: Plan vs Actual daily comparison */}
+      <div style={{...card,padding:"14px 6px 6px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,padding:"0 16px"}}>
+          <span style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600}}>計画 vs 実績（日別）</span>
+          <div style={{display:"flex",gap:12,alignItems:"center"}}>
+            <div style={{display:"flex",alignItems:"center",gap:4}}>
+              <div style={{width:10,height:10,borderRadius:2,background:"rgba(255,255,255,0.15)"}}/>
+              <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>計画</span>
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:4}}>
+              <div style={{width:10,height:10,borderRadius:2,background:"#4ade80"}}/>
+              <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>達成</span>
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:4}}>
+              <div style={{width:10,height:10,borderRadius:2,background:"#f87171"}}/>
+              <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>未達</span>
+            </div>
+          </div>
+        </div>
+        <DailyCompareChart data={compareData} />
+      </div>
+
+      {/* Chart 2: Plan/Actual */}
+      <StackedChart days={paData} fields={state.fields} showCapLine={true}
+        title="実績 + 予定（分野別積み上げ）"
+        legend={<>
+          {fieldLegend}
+          <div style={{display:"flex",alignItems:"center",gap:3}}>
+            <div style={{width:10,height:10,borderRadius:2,background:"rgba(255,255,255,0.15)",border:"1px dashed rgba(255,255,255,0.3)"}}/>
+            <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>予定</span>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:3}}>
+            <div style={{width:10,height:10,borderRadius:2,background:"rgba(129,140,248,0.6)"}}/>
+            <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>実績</span>
+          </div>
+        </>}
+      />
+
+      {/* Per-field */}
+      <div style={card}>
+        <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>分野別</div>
+        {state.fields.map((f,i)=>{
+          const te=fieldEff(f);const ae=logsEff(f,state.logs);const t=today();
+          let latestD=t;Object.keys(state.logs).forEach(d=>{const arr=state.logs[d];if(Array.isArray(arr)&&arr.some(e=>e.fid===f.id)&&d>latestD)latestD=d;});
+          let pln=0,d=f.startDate;while(d<=latestD&&pln<te){pln=Math.min(pln+fieldReq(f,d),te);d=addD(d,1);}
+          const diff=ae-pln;const dayReq=fieldReq(f,t);const daysDiff=dayReq>0?(diff/dayReq):0;
+          return (
+            <div key={f.id} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+              <div style={{width:6,height:6,borderRadius:"50%",background:CL[i%CL.length],flexShrink:0}}/>
+              <span style={{color:"rgba(255,255,255,0.6)",fontSize:12,flex:1}}>{f.name}</span>
+              <span style={{color:diff>=0?"#4ade80":"#f87171",fontSize:12,fontWeight:700,minWidth:70,textAlign:"right"}}>{diff>=0?"+":""}{diff.toFixed(0)}p ({daysDiff>=0?"+":""}{daysDiff.toFixed(1)}日)</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ═══ Tab 3: Daily ═══
+function DailyTab({state,persist}) {
+  const [vd,setVd]=useState(today());
+  const [sf,setSf]=useState(null);const [sb,setSb]=useState(null);const [pg,setPg]=useState("");const [ei,setEi]=useState(null);
+  const reset=()=>{setSb(null);setPg("");setEi(null);};
+  const go=(d)=>{setVd(d);reset();};
+  const dReq=dailyReq(vd);
+  const dl=Array.isArray(state.logs[vd])?state.logs[vd]:[];
+  const fs=state.fields.map(f=>{
+    const req=fieldReq(f,vd);let act=0;
+    dl.forEach(e=>{if(e.fid!==f.id)return;const b=f.books.find(x=>x.id===e.bid);if(b)act+=e.pg*(b.coeff||1);});
+    return {f,req,act};
+  });
+  const tReq=fs.reduce((s,x)=>s+x.req,0);const tAct=fs.reduce((s,x)=>s+x.act,0);
+  const pct=tReq>0?Math.min(tAct/tReq*100,100):0;
+
+  function saveLog(){
+    const p=parseInt(pg);if(!sf||!sb||!p||p<=0)return;
+    const ns=JSON.parse(JSON.stringify(state));
+    if(!ns.logs[vd])ns.logs[vd]=[];
+    if(ei!==null&&ei<ns.logs[vd].length){
+      const old=ns.logs[vd][ei];
+      ns.fields=ns.fields.map(f=>f.id!==old.fid?f:{...f,books:f.books.map(b=>b.id!==old.bid?b:{...b,pagesRead:Math.max(0,b.pagesRead-old.pg)})});
+      ns.logs[vd][ei]={fid:sf,bid:sb,pg:p};
+    }else{ns.logs[vd].push({fid:sf,bid:sb,pg:p});}
+    ns.fields=ns.fields.map(f=>f.id!==sf?f:{...f,books:f.books.map(b=>b.id!==sb?b:{...b,pagesRead:Math.min(b.pagesRead+p,b.totalPages)})});
+    persist(ns);reset();
+  }
+  function delLog(idx){
+    const ns=JSON.parse(JSON.stringify(state));const arr=ns.logs[vd];if(!arr||idx>=arr.length)return;
+    const entry=arr[idx];
+    ns.fields=ns.fields.map(f=>f.id!==entry.fid?f:{...f,books:f.books.map(b=>b.id!==entry.bid?b:{...b,pagesRead:Math.max(0,b.pagesRead-entry.pg)})});
+    arr.splice(idx,1);if(arr.length===0)delete ns.logs[vd];
+    persist(ns);reset();
+  }
+  function startEd(idx){const e=dl[idx];if(!e)return;setSf(e.fid);setSb(e.bid);setPg(String(e.pg));setEi(idx);}
+  const selF=state.fields.find(f=>f.id===sf);const selB=selF?.books.find(b=>b.id===sb);
+
+  return (
+    <div>
+      <div style={{...card,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}>
+        <button onClick={()=>go(addD(vd,-1))} style={{background:"rgba(255,255,255,0.08)",color:"#fff",border:"none",borderRadius:10,padding:"10px 16px",cursor:"pointer",fontSize:16,flexShrink:0}}>◀</button>
+        <div style={{textAlign:"center",flex:1}}>
+          <div style={{color:"#fff",fontSize:16,fontWeight:700}}>{fF(vd)} ({dw(vd)})</div>
+          <div style={{display:"flex",gap:8,justifyContent:"center",alignItems:"center",marginTop:4}}>
+            <span style={{color:"rgba(255,255,255,0.3)",fontSize:11}}>{isWe(vd)?"🟣 休日":"🟢 平日"} · {diffD(GS,vd)+1}日目</span>
+            {vd!==today()&&<button onClick={()=>go(today())} style={{background:"rgba(251,191,36,0.15)",color:"#fbbf24",border:"none",borderRadius:6,padding:"2px 8px",fontSize:10,cursor:"pointer"}}>今日へ</button>}
+          </div>
+        </div>
+        <button onClick={()=>go(addD(vd,1))} style={{background:"rgba(255,255,255,0.08)",color:"#fff",border:"none",borderRadius:10,padding:"10px 16px",cursor:"pointer",fontSize:16,flexShrink:0}}>▶</button>
+      </div>
+
+      <div style={card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>ノルマ</span>
+          <span style={{color:"#fbbf24",fontSize:22,fontWeight:700}}>{dReq.toFixed(1)}<span style={{fontSize:12,fontWeight:400}}> 実質p</span></span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <div style={{flex:1,background:"rgba(255,255,255,0.06)",borderRadius:6,height:8,overflow:"hidden"}}>
+            <div style={{width:`${pct}%`,height:"100%",background:pct>=100?"#4ade80":"linear-gradient(90deg,#818cf8,#c084fc)",borderRadius:6}}/>
+          </div>
+          <span style={{color:pct>=100?"#4ade80":"#fff",fontSize:14,fontWeight:700}}>{pct.toFixed(0)}%</span>
+        </div>
+        <div style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginTop:4,textAlign:"right"}}>{tAct.toFixed(1)} / {tReq.toFixed(1)} 実質p</div>
+      </div>
+
+      <div style={{...card,padding:"14px 18px"}}>
+        <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>分野別</div>
+        {fs.map((x,i)=>{
+          const p=x.req>0?Math.min(x.act/x.req*100,100):0;
+          if(vd<x.f.startDate) return <div key={x.f.id} style={{padding:"6px 0",opacity:0.4,fontSize:12,color:"rgba(255,255,255,0.4)"}}>{x.f.name}—{fF(x.f.startDate)}から</div>;
+          const cb=x.f.books.find(b=>b.pagesRead<b.totalPages);
+          const hint=cb&&x.req>0?(x.req/(cb.coeff||1)):0;
+          return (
+            <div key={x.f.id} style={{padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <div style={{width:6,height:6,borderRadius:"50%",background:CL[i%CL.length]}}/>
+                  <span style={{color:"rgba(255,255,255,0.8)",fontSize:13,fontWeight:600}}>{x.f.name}</span>
+                </div>
+                <span style={{color:p>=100?"#4ade80":"rgba(255,255,255,0.5)",fontSize:12,fontWeight:700}}>
+                  {x.act.toFixed(1)}/{x.req.toFixed(1)} {p>=100?"✓":`(${p.toFixed(0)}%)`}
+                </span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <div style={{flex:1,background:"rgba(255,255,255,0.06)",borderRadius:3,height:4,overflow:"hidden"}}>
+                  <div style={{width:`${p}%`,height:"100%",background:CL[i%CL.length],borderRadius:3}}/>
+                </div>
+              </div>
+              {cb&&hint>0&&p<100&&<div style={{color:"rgba(255,255,255,0.2)",fontSize:10,marginTop:2}}>→「{cb.title}」約{hint.toFixed(0)}実ページ（係数{cb.coeff}）</div>}
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={card}>
+        <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600,marginBottom:10}}>{ei!==null?"📝 編集":"✏️ 追加"}</div>
+        <label style={lb}>分野</label>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>
+          {state.fields.map((f,i)=>(
+            <button key={f.id} onClick={()=>{setSf(f.id);setSb(null);setPg("");setEi(null);}} style={{
+              background:sf===f.id?CL[i%CL.length]+"33":"rgba(255,255,255,0.04)",
+              color:sf===f.id?CL[i%CL.length]:"rgba(255,255,255,0.5)",
+              border:`1px solid ${sf===f.id?CL[i%CL.length]+"55":"rgba(255,255,255,0.08)"}`,
+              borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",
+            }}>{f.name}</button>
+          ))}
+        </div>
+        {selF&&(<>
+          <label style={lb}>本</label>
+          <div style={{display:"flex",flexDirection:"column",gap:4,marginBottom:10}}>
+            {selF.books.map(b=>(
+              <button key={b.id} onClick={()=>{setSb(b.id);setPg("");}} style={{
+                background:sb===b.id?"rgba(251,191,36,0.1)":"rgba(255,255,255,0.03)",
+                border:sb===b.id?"1px solid rgba(251,191,36,0.3)":"1px solid rgba(255,255,255,0.06)",
+                borderRadius:8,padding:"8px 12px",textAlign:"left",cursor:"pointer",color:"#fff",
+              }}>
+                <div style={{fontSize:12,fontWeight:sb===b.id?600:400}}>{b.title}</div>
+                <div style={{color:"rgba(255,255,255,0.25)",fontSize:10}}>{b.pagesRead}/{b.totalPages}p · 係数{b.coeff}</div>
+              </button>
+            ))}
+          </div>
+        </>)}
+        {selB&&(<>
+          <label style={lb}>読んだ実ページ数</label>
+          <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+            <input type="number" value={pg} onChange={e=>setPg(e.target.value)} placeholder="例: 20"
+              style={{...inp,fontSize:18,fontWeight:700,padding:"10px 14px",flex:1}} onKeyDown={e=>{if(e.key==="Enter")saveLog();}}/>
+            {pg&&parseInt(pg)>0&&<div style={{color:"#fbbf24",fontSize:12,fontWeight:600,marginBottom:10,whiteSpace:"nowrap"}}>={(parseInt(pg)*(selB.coeff||1)).toFixed(1)}実質p</div>}
+          </div>
+          <div style={{display:"flex",gap:8,marginTop:10}}>
+            {ei!==null&&<button onClick={reset} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13}}>キャンセル</button>}
+            <button onClick={saveLog} style={{flex:1,background:"#fbbf24",color:"#000",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:14,fontWeight:700}}>{ei!==null?"更新":"記録する"}</button>
+          </div>
+        </>)}
+      </div>
+
+      {dl.length>0&&(
+        <div style={card}>
+          <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>📝 {fS(vd)} の記録</div>
+          {dl.map((e,i)=>{
+            const f=state.fields.find(x=>x.id===e.fid);const b=f?.books.find(x=>x.id===e.bid);
+            const fi=f?state.fields.indexOf(f):0;const eff=e.pg*(b?.coeff||1);
+            return (
+              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <span style={{color:CL[fi%CL.length],fontSize:11}}>{f?.name}</span>
+                  <span style={{color:"rgba(255,255,255,0.35)",fontSize:11,marginLeft:6}}>{b?.title}</span>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                  <span style={{color:"rgba(255,255,255,0.6)",fontSize:12}}>{e.pg}p</span>
+                  <span style={{color:"rgba(255,255,255,0.25)",fontSize:10}}>({eff.toFixed(1)})</span>
+                  <button onClick={()=>startEd(i)} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.4)",border:"none",borderRadius:6,padding:"3px 8px",fontSize:10,cursor:"pointer"}}>編集</button>
+                  <button onClick={()=>delLog(i)} style={{background:"rgba(248,113,113,0.08)",color:"#f87171",border:"none",borderRadius:6,padding:"3px 8px",fontSize:10,cursor:"pointer"}}>削除</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══ Main ═══
+function App() {
+  const [st,setSt]=useState(DEF);const [ld,setLd]=useState(true);const [tab,setTab]=useState("daily");
+  const [importText,setImportText]=useState("");
+  const [syncMsg,setSyncMsg]=useState("");
+  const [dataEmpty,setDataEmpty]=useState(false);
+  const [showCopyDone,setShowCopyDone]=useState(false);
+  const [showAdvSync,setShowAdvSync]=useState(false);
+  const [cloudStatus,setCloudStatus]=useState(""); // ""/"syncing"/"ok"/"error"
+
+  useEffect(()=>{
+    (async()=>{
+      const d=await load();
+      if(d&&d.fields&&d.fields.length>0){setSt(d);setDataEmpty(false);}
+      else{setDataEmpty(true);}
+      setLd(false);
+    })();
+  },[]);
+
+  const ps=useCallback(ns=>{
+    setSt(ns);save(ns);
+    setDataEmpty(!ns.fields||ns.fields.length===0);
+    setCloudStatus("syncing");
+    saveCloud(ns).then(ok=>{setCloudStatus(ok?"ok":"error");setTimeout(()=>setCloudStatus(""),3000);});
+  },[]);
+
+  async function pullCloud2(){
+    setCloudStatus("syncing");setSyncMsg("");
+    const d=await loadCloud();
+    if(d&&d.fields){setSt(d);saveLocal(d);setCloudStatus("ok");setSyncMsg("✅ クラウドから取得しました");setDataEmpty(false);}
+    else{setCloudStatus("error");setSyncMsg("❌ 取得失敗。接続を確認してください。");}
+    setTimeout(()=>{setCloudStatus("");setSyncMsg("");},4000);
+  }
+  async function pushCloud2(){
+    setCloudStatus("syncing");setSyncMsg("");
+    const ok=await saveCloud(st);
+    setCloudStatus(ok?"ok":"error");
+    setSyncMsg(ok?"✅ クラウドに保存しました":"❌ 保存に失敗しました");
+    setTimeout(()=>{setCloudStatus("");setSyncMsg("");},4000);
+  }
+
+  function copyData(){
+    const json=JSON.stringify(st);let copied=false;
+    try{const ta=document.createElement("textarea");ta.value=json;ta.style.cssText="position:fixed;left:-9999px;top:-9999px;opacity:0;";document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,json.length);copied=document.execCommand("copy");document.body.removeChild(ta);}catch{}
+    if(!copied){try{navigator.clipboard.writeText(json).then(()=>{setShowCopyDone(true);setTimeout(()=>setShowCopyDone(false),2500);}).catch(()=>{setImportText(json);setShowAdvSync(true);setSyncMsg("📋 テキストを全選択→コピーしてください。");});return;}catch{}}
+    if(copied){setShowCopyDone(true);setTimeout(()=>setShowCopyDone(false),2500);}
+    else{setImportText(json);setShowAdvSync(true);setSyncMsg("📋 テキストを全選択→コピーしてください。");}
+  }
+
+  function doRestore(){
+    try{const data=JSON.parse(importText);if(!data.fields)throw new Error("invalid");if(!data.logs)data.logs={};ps(data);setSyncMsg("✅ データを復元しました！");setImportText("");setDataEmpty(false);setTimeout(()=>setSyncMsg(""),3000);}
+    catch{setSyncMsg("❌ データ形式が正しくありません。");}
+  }
+
+  if(ld) return <div style={{minHeight:"100vh",background:"#0a0e14",display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{color:"rgba(255,255,255,0.4)"}}>読み込み中...</div></div>;
+
+  if(dataEmpty && st.fields.length===0){
+    return (
+      <div style={{minHeight:"100vh",background:"#0a0e14",fontFamily:"'Noto Sans JP','Hiragino Sans',sans-serif"}}>
+        <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+        <div style={{maxWidth:540,margin:"0 auto",padding:"40px 16px"}}>
+          <div style={{textAlign:"center",marginBottom:32}}>
+            <div style={{fontSize:48,marginBottom:12}}>📚</div>
+            <h1 style={{color:"#fff",fontSize:22,fontWeight:700,margin:"0 0 8px"}}>勉強計画トラッカー</h1>
+            <p style={{color:"rgba(255,255,255,0.4)",fontSize:13,lineHeight:1.7}}>データが見つかりません。</p>
+          </div>
+          <div style={{...card,borderColor:"rgba(74,222,128,0.2)"}}>
+            <div style={{color:"#4ade80",fontSize:14,fontWeight:600,marginBottom:10}}>☁️ Google Docsから復元</div>
+            <button onClick={async()=>{setSyncMsg("⏳ 取得中...");const d=await loadCloud();if(d&&d.fields&&d.fields.length>0){setSt(d);saveLocal(d);setDataEmpty(false);setSyncMsg("✅ 復元しました！");}else{setSyncMsg("❌ データが見つかりませんでした。");}}} style={{width:"100%",background:"#4ade80",color:"#000",border:"none",borderRadius:10,padding:"14px",fontSize:14,fontWeight:700,cursor:"pointer"}}>☁️ クラウドから復元</button>
+          </div>
+          <div style={{...card,borderColor:"rgba(129,140,248,0.2)"}}>
+            <div style={{color:"#818cf8",fontSize:14,fontWeight:600,marginBottom:10}}>📥 手動で復元</div>
+            <textarea value={importText} onChange={e=>setImportText(e.target.value)} placeholder="コピーしたデータを貼り付け..." rows={4} style={{...inp,fontSize:12,fontFamily:"monospace",resize:"vertical",marginBottom:10}} />
+            <button onClick={doRestore} style={{width:"100%",background:importText?"#818cf8":"rgba(255,255,255,0.03)",color:importText?"#fff":"rgba(255,255,255,0.2)",border:"none",borderRadius:10,padding:"14px",fontSize:14,fontWeight:700,cursor:importText?"pointer":"default"}}>復元する</button>
+            {syncMsg&&<div style={{color:syncMsg.startsWith("✅")?"#4ade80":"#f87171",fontSize:12,marginTop:10}}>{syncMsg}</div>}
+          </div>
+          <div style={{textAlign:"center",marginTop:20}}>
+            <button onClick={()=>setDataEmpty(false)} style={{background:"none",border:"none",color:"rgba(255,255,255,0.25)",fontSize:12,cursor:"pointer",textDecoration:"underline"}}>復元せずに新規で始める</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{minHeight:"100vh",background:"#0a0e14",fontFamily:"'Noto Sans JP','Hiragino Sans',sans-serif"}}>
+      <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+      <div style={{maxWidth:540,margin:"0 auto",padding:"16px 16px 120px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+          <h1 style={{color:"#fff",fontSize:18,fontWeight:700,margin:0}}>📚 勉強計画トラッカー</h1>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{fontSize:9,color:cloudStatus==="ok"?"#4ade80":cloudStatus==="syncing"?"#fbbf24":cloudStatus==="error"?"#f87171":"rgba(255,255,255,0.2)"}}>
+              {cloudStatus==="syncing"?"⏳":cloudStatus==="ok"?"☁️✓":cloudStatus==="error"?"☁️✗":"☁️"}
+            </span>
+            <button onClick={()=>setShowAdvSync(!showAdvSync)} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,padding:"4px 10px",color:"rgba(255,255,255,0.5)",fontSize:10,cursor:"pointer"}}>🔄 同期</button>
+            <button onClick={()=>{if(window.confirm("全データをリセット？"))ps(DEF);}} style={{background:"none",border:"none",color:"rgba(255,255,255,0.12)",fontSize:10,cursor:"pointer"}}>リセット</button>
+          </div>
+        </div>
+
+        {showAdvSync && (
+          <div style={{...card,borderColor:"rgba(129,140,248,0.2)"}}>
+            <div style={{color:"#4ade80",fontSize:13,fontWeight:600,marginBottom:8}}>☁️ Google Docs 同期</div>
+            <div style={{display:"flex",gap:6,marginBottom:10}}>
+              <button onClick={pushCloud2} disabled={cloudStatus==="syncing"} style={{flex:1,background:"rgba(74,222,128,0.08)",color:"#4ade80",border:"1px solid rgba(74,222,128,0.15)",borderRadius:8,padding:"10px",fontSize:12,fontWeight:600,cursor:"pointer"}}>
+                {cloudStatus==="syncing"?"⏳...":"☁️↑ 保存"}
+              </button>
+              <button onClick={pullCloud2} disabled={cloudStatus==="syncing"} style={{flex:1,background:"rgba(129,140,248,0.08)",color:"#818cf8",border:"1px solid rgba(129,140,248,0.15)",borderRadius:8,padding:"10px",fontSize:12,fontWeight:600,cursor:"pointer"}}>
+                {cloudStatus==="syncing"?"⏳...":"☁️↓ 取得"}
+              </button>
+            </div>
+            <div style={{borderTop:"1px solid rgba(255,255,255,0.06)",margin:"10px 0"}}/>
+            <div style={{color:"#818cf8",fontSize:12,fontWeight:600,marginBottom:6}}>📋 手動コピー＆復元</div>
+            <button onClick={copyData} style={{width:"100%",background:"rgba(255,255,255,0.04)",color:"rgba(255,255,255,0.5)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,padding:"8px",fontSize:11,fontWeight:600,cursor:"pointer",marginBottom:8}}>📋 データをコピー</button>
+            <textarea value={importText} onChange={e=>setImportText(e.target.value)} placeholder="データを貼り付けて復元..." rows={2} style={{...inp,fontSize:11,fontFamily:"monospace",resize:"vertical",marginBottom:8}} />
+            <button onClick={doRestore} disabled={!importText} style={{width:"100%",background:importText?"rgba(129,140,248,0.15)":"rgba(255,255,255,0.03)",color:importText?"#818cf8":"rgba(255,255,255,0.2)",border:"1px solid "+(importText?"rgba(129,140,248,0.2)":"rgba(255,255,255,0.05)"),borderRadius:8,padding:"8px",fontSize:12,fontWeight:600,cursor:importText?"pointer":"default"}}>📥 復元する</button>
+            {syncMsg&&<div style={{color:syncMsg.startsWith("✅")?"#4ade80":syncMsg.startsWith("❌")?"#f87171":"#fbbf24",fontSize:12,marginTop:8}}>{syncMsg}</div>}
+          </div>
+        )}
+
+        <div style={{display:"flex",gap:4,marginBottom:20,background:"rgba(255,255,255,0.03)",borderRadius:12,padding:3}}>
+          {[{id:"plan",l:"計画入力",ic:"📋"},{id:"chart",l:"計画表示",ic:"📊"},{id:"daily",l:"今日の勉強",ic:"✏️"}].map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)} style={{
+              flex:1,background:tab===t.id?"rgba(255,255,255,0.08)":"transparent",
+              border:"none",borderRadius:9,padding:"10px 4px",
+              color:tab===t.id?"#fff":"rgba(255,255,255,0.35)",
+              fontSize:11,fontWeight:tab===t.id?600:400,cursor:"pointer",lineHeight:1.4,
+            }}>{t.ic}<br/>{t.l}</button>
+          ))}
+        </div>
+
+        {tab==="plan"&&<PlanTab state={st} persist={ps}/>}
+        {tab==="chart"&&<ChartTab state={st}/>}
+        {tab==="daily"&&<DailyTab state={st} persist={ps}/>}
+      </div>
+
+      {st.fields.length>0 && (
+        <div style={{position:"fixed",bottom:0,left:0,right:0,background:"linear-gradient(0deg,#0a0e14 60%,transparent)",padding:"16px 16px 12px"}}>
+          <div style={{maxWidth:540,margin:"0 auto",display:"flex",gap:8}}>
+            <button onClick={pushCloud2} disabled={cloudStatus==="syncing"} style={{
+              flex:2,
+              background:cloudStatus==="ok"?"rgba(74,222,128,0.12)":cloudStatus==="error"?"rgba(248,113,113,0.12)":"rgba(255,255,255,0.06)",
+              border:"1px solid "+(cloudStatus==="ok"?"rgba(74,222,128,0.3)":cloudStatus==="error"?"rgba(248,113,113,0.3)":"rgba(255,255,255,0.1)"),
+              borderRadius:10,padding:"10px 12px",
+              color:cloudStatus==="ok"?"#4ade80":cloudStatus==="error"?"#f87171":cloudStatus==="syncing"?"#fbbf24":"rgba(255,255,255,0.5)",
+              fontSize:11,fontWeight:600,cursor:cloudStatus==="syncing"?"wait":"pointer",
+            }}>
+              {cloudStatus==="syncing"?"⏳ 同期中...":cloudStatus==="ok"?"☁️✓ 保存済":"☁️ クラウドに保存"}
+            </button>
+            <button onClick={pullCloud2} disabled={cloudStatus==="syncing"} style={{
+              flex:1,
+              background:"rgba(129,140,248,0.06)",border:"1px solid rgba(129,140,248,0.15)",
+              borderRadius:10,padding:"10px 12px",
+              color:cloudStatus==="syncing"?"rgba(129,140,248,0.4)":"#818cf8",
+              fontSize:11,fontWeight:600,cursor:cloudStatus==="syncing"?"wait":"pointer",
+            }}>☁️↓ 取得</button>
+            <button onClick={copyData} style={{
+              background:showCopyDone?"rgba(74,222,128,0.15)":"rgba(255,255,255,0.04)",
+              border:"1px solid "+(showCopyDone?"rgba(74,222,128,0.3)":"rgba(255,255,255,0.06)"),
+              borderRadius:10,padding:"10px 12px",
+              color:showCopyDone?"#4ade80":"rgba(255,255,255,0.35)",
+              fontSize:11,fontWeight:600,cursor:"pointer",
+            }}>{showCopyDone?"✅":"📋"}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>

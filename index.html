@@ -190,7 +190,7 @@ async function load(){
   if(cloud){saveLocal(cloud);return cloud;}
   return await loadLocal();
 }
-async function save(d){saveLocal(d);saveCloud(d);}
+function save(d){saveLocal(d);} // cloud sync is handled explicitly in ps()
 
 const DEF={fields:[],logs:{}};
 

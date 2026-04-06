@@ -359,16 +359,24 @@ function buildDailyCompare(state, ff, halfWeeks) {
   const totalDays=diffD(startD,endD)+1;
   if (totalDays <= 0) return [];
   const af=ff?fields.filter(f=>f.id===ff):fields;
+  // Pre-compute field end dates (same as stacked chart)
+  const endMap=new Map();
+  af.forEach(f=>{endMap.set(f.id, fieldEnd(f));});
   const out=[];
   for(let i=0;i<totalDays;i++){
     const d=addD(startD,i);
-    // Plan = field allocation when filtered, full 100% when showing all
-    const dp = d >= GS ? (ff ? af.reduce((s,f) => s + fieldReq(f,d), 0) : dailyReq(d)) : 0;
+    // Plan = sum of fieldReq for active fields on this date (respecting startDate~fieldEnd)
+    let dp=0;
+    af.forEach(f=>{
+      const end=endMap.get(f.id);
+      if(d>=f.startDate && f.pct && (!end||d<=end)) dp+=fieldReq(f,d);
+    });
+    dp=Math.round(dp*10)/10;
     let da=0;
     const ents=Array.isArray(logs[d])?logs[d]:[];
     ents.forEach(e=>{const f=fields.find(x=>x.id===e.fid);if(!f||(ff&&f.id!==ff))return;const b=f.books.find(x=>x.id===e.bid);if(b)da+=e.pg*(b.coeff||1);});
     const hasData=d<=t||ents.length>0;
-    out.push({d,lbl:fS(d),plan:Math.round(dp*10)/10,actual:hasData?Math.round(da*10)/10:null,isToday:d===t});
+    out.push({d,lbl:fS(d),plan:dp,actual:hasData?Math.round(da*10)/10:null,isToday:d===t});
   }
   return out;
 }

@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>勉強計画トラッカー</title>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<title>勉強+瞑想 計画トラッカー</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&family=Shippori+Mincho:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -17,11 +17,18 @@ body{background:#0a0e14;font-family:'Noto Sans JP','Hiragino Sans',sans-serif;-w
 <div id="root"></div>
 <script type="text/babel">
 const {useState,useEffect,useCallback,useMemo}=React;
-// ═══ Constants ═══
+
+// ═══ Constants (Study) ═══
 const GS = "2026-03-23";
 const RAMP = 140;
 const B0 = 1, B1 = 50;
 const INCR = (B1 - B0) / (RAMP - 1);
+
+// ═══ Constants (Meditation) ═══
+const MED_START_DEFAULT = "2026-05-05";
+const MED_COLOR = "#a78bfa";
+const MED_SLOTS = ["朝","夜","その他"];
+const MED_PRACTICES = ["数息観","隨息観","只管打坐"];
 
 // ═══ Date utils (timezone-safe) ═══
 function toStr(d) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; }
@@ -35,7 +42,7 @@ function fS(s) { const d=parseD(s); return `${d.getMonth()+1}/${d.getDate()}`; }
 function dw(s) { return ["日","月","火","水","木","金","土"][parseD(s).getDay()]; }
 const gid=()=>Math.random().toString(36).slice(2,10);
 
-// ═══ Core calc ═══
+// ═══ Core calc (Study) ═══
 function dailyReq(date) {
   const n=diffD(GS,date)+1; if(n<=0) return 0;
   const base=n<=RAMP?B0+(n-1)*INCR:B1;
@@ -57,9 +64,8 @@ function logsEff(f,logs) {
   }); return t;
 }
 
-// ═══ Date-aware allocation analysis ═══
+// ═══ Date-aware allocation analysis (Study) ═══
 function getAllocOnDate(fields, date) {
-  // Returns sum of pct of all fields active on this date (before their end)
   let total = 0;
   fields.forEach(f => {
     if (date < f.startDate || !f.pct) return;
@@ -71,7 +77,6 @@ function getAllocOnDate(fields, date) {
 }
 
 function findOverAllocDays(fields) {
-  // Scan from GS to furthest field end + 30 days
   let maxEnd = GS;
   fields.forEach(f => { const e = fieldEnd(f); if (e && e > maxEnd) maxEnd = e; });
   const scanEnd = addD(maxEnd, 30);
@@ -87,7 +92,6 @@ function findOverAllocDays(fields) {
 }
 
 function findUnderAllocDays(fields) {
-  // Scan entire plan period (GS to latest field end)
   let maxEnd = GS;
   fields.forEach(f => { const e = fieldEnd(f); if (e && e > maxEnd) maxEnd = e; });
   const scanEnd = addD(maxEnd, 7);
@@ -102,7 +106,6 @@ function findUnderAllocDays(fields) {
   return issues;
 }
 
-// Summarize date ranges for display
 function summarizeRanges(days) {
   if (!days.length) return [];
   const sorted = [...days].sort((a,b) => a.date.localeCompare(b.date));
@@ -120,29 +123,93 @@ function summarizeRanges(days) {
   return ranges.slice(0, 10);
 }
 
+// ═══ Meditation calc ═══
+// Phase 1 (Week 1-2): 5分/回 × 2 = 10分/日
+// Phase 2 (Week 3-8): 週1分ずつ延長, w8で11分/回 (上限15分)
+// Phase 3 (Week 9-16): 15分/回スタート、週1分ずつ延長、w14で20分(以降cap)
+// Phase 4 (Week 17~): 20分/回スタート、週1分ずつ延長、w27で30分(以降cap)
+function medWeek(date, startDate) {
+  if (!startDate) return 0;
+  const day = diffD(startDate, date) + 1;
+  return day <= 0 ? 0 : Math.ceil(day / 7);
+}
+function medPhase(date, startDate) {
+  const w = medWeek(date, startDate);
+  if (w <= 0) return 0;
+  if (w <= 2) return 1;
+  if (w <= 8) return 2;
+  if (w <= 16) return 3;
+  return 4;
+}
+function medPerSessionPlan(date, startDate) {
+  const w = medWeek(date, startDate);
+  if (w <= 0) return 0;
+  if (w <= 2) return 5;
+  if (w <= 8) return Math.min(5 + (w - 2), 15);
+  if (w <= 16) return Math.min(15 + (w - 9), 20);
+  return Math.min(20 + (w - 17), 30);
+}
+function medDailyPlan(date, startDate) {
+  return medPerSessionPlan(date, startDate) * 2;
+}
+function medDefaultPractice(date, startDate) {
+  const p = medPhase(date, startDate);
+  if (p === 3) return "隨息観";
+  if (p === 4) return "只管打坐";
+  return "数息観";
+}
+function medCheckMissTwice(meditation) {
+  if (!meditation || !meditation.startDate) return null;
+  const t = today();
+  if (t < meditation.startDate) return null;
+  const sessions = meditation.sessions || {};
+  const has = d => Array.isArray(sessions[d]) && sessions[d].length > 0;
+  const todayHas = has(t);
+  let miss = 0, d = addD(t, -1);
+  while (d >= meditation.startDate && !has(d)) {
+    miss++;
+    d = addD(d, -1);
+    if (miss > 60) break;
+  }
+  if (miss >= 2 && !todayHas) {
+    return { level: "red", text: `${miss}日連続で記録なし。今日記録すれば習慣を取り戻せます。` };
+  }
+  if (miss === 1 && !todayHas) {
+    return { level: "yellow", text: "昨日は記録なし。Never miss twice — 今日はやりましょう。" };
+  }
+  return null;
+}
+
 // ═══ Storage ═══
 const SK="study-v6";
-const GAS_URL="https://script.google.com/macros/s/AKfycbwtt7pGyG-SwchaEjfyru6r6yKv05aGWK5Xa_Ct92KsBOV81dmv0Y2C1-HUg27YlL0Z/exec";
-const API_KEY="kano_study_2026_secret"; // GAS側と同じキー
+const GAS_URL="https://script.google.com/macros/s/AKfycbxBWoJBEKDTPzAP8lo94OoXdYyS92TlcFu3EG3gmewWxbHE-jeJ8VsnNDqElEISueK9/exec";
+const API_KEY="kano_study_2026_secret";
 
-// Local storage
 function loadLocal(){try{const r=localStorage.getItem(SK);return r?JSON.parse(r):null;}catch{return null;}}
 function saveLocal(d){try{localStorage.setItem(SK,JSON.stringify(d));}catch{}}
 
-// Cloud load: fetch with API key
+function migrateMed(state){
+  if(!state) return state;
+  if(!state.meditation || typeof state.meditation !== "object"){
+    state.meditation = {startDate: MED_START_DEFAULT, sessions: {}};
+  } else {
+    if(!state.meditation.startDate) state.meditation.startDate = MED_START_DEFAULT;
+    if(!state.meditation.sessions || typeof state.meditation.sessions !== "object") state.meditation.sessions = {};
+  }
+  return state;
+}
+
 async function loadCloud(){
-  // Method 1: fetch GAS with key
   try{
     const res=await fetch(GAS_URL+"?key="+encodeURIComponent(API_KEY));
-    if(res.ok){const d=await res.json();if(d&&d.fields)return d;}
+    if(res.ok){const d=await res.json();if(d&&d.fields!==undefined)return d;}
   }catch{}
-  // Method 2: JSONP with key
   return new Promise((resolve)=>{
     const cb="_gcb"+Date.now();
     const timer=setTimeout(()=>{delete window[cb];resolve(null);},8000);
     window[cb]=(data)=>{
       clearTimeout(timer);delete window[cb];
-      try{if(typeof data==="string")data=JSON.parse(data);resolve(data&&data.fields?data:null);}catch{resolve(null);}
+      try{if(typeof data==="string")data=JSON.parse(data);resolve(data&&data.fields!==undefined?data:null);}catch{resolve(null);}
     };
     const s=document.createElement("script");
     s.src=GAS_URL+"?key="+encodeURIComponent(API_KEY)+"&callback="+cb;
@@ -152,15 +219,12 @@ async function loadCloud(){
   });
 }
 
-// Cloud save: fetch POST with key, fallback to form POST
 async function saveCloud(d){
   const json=JSON.stringify(d);
-  // Method 1: fetch POST
   try{
     const res=await fetch(GAS_URL+"?key="+encodeURIComponent(API_KEY),{method:"POST",body:json,headers:{"Content-Type":"text/plain"}});
     if(res.ok) return true;
   }catch{}
-  // Method 2: form POST with key in hidden field
   return new Promise((resolve)=>{
     try{
       const fn="gsf"+Date.now();
@@ -184,15 +248,15 @@ async function saveCloud(d){
   });
 }
 
-// Combined: cloud first, then local
 async function load(){
   const cloud=await loadCloud();
-  if(cloud){saveLocal(cloud);return cloud;}
-  return await loadLocal();
+  if(cloud){const m=migrateMed(cloud);saveLocal(m);return m;}
+  const local=await loadLocal();
+  return migrateMed(local);
 }
-function save(d){saveLocal(d);} // cloud sync is handled explicitly in ps()
+function save(d){saveLocal(d);}
 
-const DEF={fields:[],logs:{}};
+const DEF={fields:[],logs:{},meditation:{startDate:MED_START_DEFAULT,sessions:{}}};
 
 // ═══ Styles ═══
 const card={background:"linear-gradient(135deg,#0f1419,#1a1f2e)",borderRadius:16,padding:"18px 22px",border:"1px solid rgba(255,255,255,0.06)",marginBottom:16};
@@ -204,7 +268,6 @@ function fmtRange(w){if(w<4)return`${w}週間`;const m=Math.round(w/4.33);if(m<1
 // ═══ SVG: Stacked Bar Chart ═══
 function StackedChart({ days: rawDays, fields, w=540, h=220, showCapLine=false, title, legend }) {
   if (!rawDays.length) return null;
-  // Downsample if too many points
   let days = rawDays;
   if (rawDays.length > 120) {
     const bs = Math.ceil(rawDays.length / 120);
@@ -233,8 +296,6 @@ function StackedChart({ days: rawDays, fields, w=540, h=220, showCapLine=false, 
   const todayIdx=days.findIndex(d=>d.d===today());
   const labelStep=Math.max(1,Math.floor(n/14));
   const yTicks=5; const yStep=maxY/yTicks;
-
-  // Capacity line path
   let capPath="";
   if(showCapLine){
     days.forEach((d,i)=>{
@@ -242,7 +303,6 @@ function StackedChart({ days: rawDays, fields, w=540, h=220, showCapLine=false, 
       capPath+=(i===0?"M":"L")+`${xC(i)},${yS(d.cap)}`;
     });
   }
-
   return (
     <div style={{...card,padding:"14px 6px 6px"}}>
       {title && <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:4,padding:"0 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -250,15 +310,12 @@ function StackedChart({ days: rawDays, fields, w=540, h=220, showCapLine=false, 
         {legend && <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{legend}</div>}
       </div>}
       <svg viewBox={`0 0 ${w} ${h}`} style={{width:"100%",height:"auto",display:"block"}}>
-        {/* Grid + Y labels */}
         {Array.from({length:yTicks+1},(_,i)=>{
           const v=Math.round(yStep*i);
           return <g key={i}><line x1={pad.l} x2={w-pad.r} y1={yS(v)} y2={yS(v)} stroke="rgba(255,255,255,0.04)"/>
             <text x={pad.l-5} y={yS(v)+3} fill="rgba(255,255,255,0.25)" fontSize="9" textAnchor="end">{v}</text></g>;
         })}
-        {/* Today highlight */}
         {todayIdx>=0 && <rect x={pad.l+todayIdx*barSlot} y={pad.t} width={barSlot} height={ph} fill="rgba(251,191,36,0.06)"/>}
-        {/* Stacked bars */}
         {days.map((day,i)=>{
           let cumH=0;
           return <g key={i}>{day.segments.map((seg,si)=>{
@@ -273,14 +330,11 @@ function StackedChart({ days: rawDays, fields, w=540, h=220, showCapLine=false, 
                   fill={seg.color} opacity={0.75}/>;
           })}</g>;
         })}
-        {/* Capacity line */}
         {showCapLine && capPath && <path d={capPath} fill="none" stroke="rgba(255,255,255,0.35)" strokeWidth="1.5" strokeDasharray="5 3"/>}
-        {/* Today line */}
         {todayIdx>=0 && <>
           <line x1={xC(todayIdx)} x2={xC(todayIdx)} y1={pad.t-4} y2={pad.t+ph+2} stroke="#fbbf24" strokeWidth="1.5" strokeDasharray="3 3"/>
           <text x={xC(todayIdx)} y={pad.t-6} fill="#fbbf24" fontSize="9" textAnchor="middle" fontWeight="600">今日</text>
         </>}
-        {/* X labels */}
         {days.map((d,i)=>{
           if(i%labelStep!==0&&i!==todayIdx)return null;
           return <text key={i} x={xC(i)} y={h-6} fill={i===todayIdx?"#fbbf24":"rgba(255,255,255,0.25)"} fontSize="8" textAnchor="middle" fontWeight={i===todayIdx?"600":"400"}>{d.lbl}</text>;
@@ -290,10 +344,9 @@ function StackedChart({ days: rawDays, fields, w=540, h=220, showCapLine=false, 
   );
 }
 
-// ═══ SVG: Plan vs Actual daily bars ═══
-function DailyCompareChart({ data: rawData, w=540, h=220 }) {
+// ═══ SVG: Plan vs Actual daily bars (successColor 上書き可) ═══
+function DailyCompareChart({ data: rawData, w=540, h=220, successColor="#4ade80", failColor="#f87171" }) {
   if (!rawData.length) return null;
-  // Downsample if too many points: aggregate into buckets
   let data = rawData;
   if (rawData.length > 120) {
     const bucketSize = Math.ceil(rawData.length / 120);
@@ -334,8 +387,8 @@ function DailyCompareChart({ data: rawData, w=540, h=220 }) {
         const planH=(d.plan/maxY)*ph;
         const actH=d.actual!==null?(d.actual/maxY)*ph:0;
         return <g key={i}>
-          <rect x={cx-barW-gap/2} y={yS(d.plan)} width={barW} height={Math.max(planH,0.5)} rx={1} fill="rgba(255,255,255,0.15)"/>
-          {d.actual!==null&&<rect x={cx+gap/2} y={yS(d.actual)} width={barW} height={Math.max(actH,0.5)} rx={1} fill={d.actual>=d.plan?"#4ade80":"#f87171"} opacity={0.8}/>}
+          {d.plan>0 && <rect x={cx-barW-gap/2} y={yS(d.plan)} width={barW} height={Math.max(planH,0.5)} rx={1} fill="rgba(255,255,255,0.15)"/>}
+          {d.actual!==null&&d.actual>0&&<rect x={cx+gap/2} y={yS(d.actual)} width={barW} height={Math.max(actH,0.5)} rx={1} fill={d.actual>=d.plan&&d.plan>0?successColor:failColor} opacity={0.8}/>}
         </g>;
       })}
       {todayIdx>=0&&<>
@@ -354,18 +407,15 @@ function DailyCompareChart({ data: rawData, w=540, h=220 }) {
 function buildDailyCompare(state, ff, halfWeeks) {
   const { fields, logs } = state;
   const t=today(); const halfDays=halfWeeks*7;
-  // Always keep today centered - don't clamp to GS
   const startD=addD(t,-halfDays), endD=addD(t,halfDays);
   const totalDays=diffD(startD,endD)+1;
   if (totalDays <= 0) return [];
   const af=ff?fields.filter(f=>f.id===ff):fields;
-  // Pre-compute field end dates (same as stacked chart)
   const endMap=new Map();
   af.forEach(f=>{endMap.set(f.id, fieldEnd(f));});
   const out=[];
   for(let i=0;i<totalDays;i++){
     const d=addD(startD,i);
-    // Plan = sum of fieldReq for active fields on this date (respecting startDate~fieldEnd)
     let dp=0;
     af.forEach(f=>{
       const end=endMap.get(f.id);
@@ -384,7 +434,6 @@ function buildDailyCompare(state, ff, halfWeeks) {
 function buildPlanActualChart(state, halfWeeks) {
   const { fields, logs } = state;
   const t=today(); const halfDays=halfWeeks*7;
-  // Keep today centered
   const startD=addD(t,-halfDays), endD=addD(t,halfDays);
   const totalDays=diffD(startD,endD)+1;
   if (totalDays <= 0) return [];
@@ -396,7 +445,6 @@ function buildPlanActualChart(state, halfWeeks) {
     const ents=Array.isArray(logs[d])?logs[d]:[];
     const hasLog=ents.length>0;
     const isFuture=d>t && !hasLog;
-
     const segments=[];
     if(isFuture){
       fields.forEach((f,fi)=>{
@@ -418,6 +466,27 @@ function buildPlanActualChart(state, halfWeeks) {
     }
     const cap=dailyReq(d);
     out.push({d,lbl:fS(d),cap,segments,total:segments.reduce((s,x)=>s+x.val,0)});
+  }
+  return out;
+}
+
+function buildMedDailyCompare(state, halfWeeks) {
+  const med = state.meditation;
+  if (!med || !med.startDate) return [];
+  const t = today();
+  const halfDays = halfWeeks * 7;
+  const startD = addD(t, -halfDays);
+  const endD = addD(t, halfDays);
+  const totalDays = diffD(startD, endD) + 1;
+  if (totalDays <= 0) return [];
+  const out = [];
+  for (let i = 0; i < totalDays; i++) {
+    const d = addD(startD, i);
+    const plan = (d >= med.startDate) ? medDailyPlan(d, med.startDate) : 0;
+    const sess = Array.isArray(med.sessions[d]) ? med.sessions[d] : [];
+    const actual = sess.reduce((s, x) => s + (x.duration || 0), 0);
+    const hasData = d <= t || sess.length > 0;
+    out.push({ d, lbl: fS(d), plan, actual: hasData ? actual : null, isToday: d === t });
   }
   return out;
 }
@@ -444,10 +513,167 @@ function calcCum(state, ff) {
   return {pageDiff:Math.round(pageDiff*10)/10,daysDiff:Math.round(daysDiff*10)/10,cumPlan:Math.round(cumP),cumActual:Math.round(cumA)};
 }
 
+// ═══ Meditation procedure data (圧縮+展開) ═══
+// 02 (姿勢) のみ summaryLines を持ち、太字8項目を全部圧縮側に表示
+const MED_PROCEDURE = [
+  {
+    num: "01", title: "環境を整える", time: "1分",
+    summary: "照明少し暗く / スマホ別室 / タイマー5分 / 少し肌寒く",
+    details: [
+      "部屋の照明を少し暗くする(間接照明か常夜灯程度)",
+      "スマホを別の部屋に置くか、機内モード+手の届かない場所へ",
+      "タイマーを5分にセット(物理タイマー or 瞑想アプリ。終了音は穏やかなベル音)",
+      "気温は少し肌寒いくらいが眠気を防ぐ。寒すぎる場合は薄手のブランケットを膝に"
+    ]
+  },
+  {
+    num: "02", title: "姿勢を作る ── 椅子坐法", time: "30秒",
+    summaryLines: [
+      "椅子の前1/3に浅く腰掛ける(背もたれにもたれない)",
+      "両足を床にしっかり付ける(腰幅、足裏全体接地)",
+      "骨盤を立てる(坐骨が椅子に直接当たる位置)",
+      "背筋を自然に伸ばす(頭頂から糸で吊られているイメージ)",
+      "顎をわずかに引く(後頭部が真上に向かう)",
+      "肩を一度すくめてから、ストンと落とす",
+      "手の置き方: 法界定印 または 両手のひらを下に向け太ももの上",
+      "口は閉じる、舌先を上の前歯の付け根の裏側に軽く当てる"
+    ],
+    details: [
+      "背もたれのある椅子を使う。座椅子も結跏趺坐(フルロータス)も最初は不要",
+      "もたれると眠くなるので絶対にもたれない",
+      "法界定印: 左手のひらを上に向けて膝の前で軽く開き、右手を上に重ね、両親指の先を軽く合わせ、下腹部前で楕円を作る",
+      "胸を張りすぎない、腰を反らせすぎない。脱力位置を見つける",
+      "歯は軽く合わせるだけ。舌先を上の前歯の付け根の裏側に当てると唾液処理が楽"
+    ]
+  },
+  {
+    num: "03", title: "目を整える", time: "5秒",
+    summary: "目を閉じる(初心) または 半眼(慣れたら、視線45度下、約1m先の床)",
+    details: [
+      "(a) 目を閉じる: 集中しやすい(MBSRの伝統)。眠気が出やすいのが弱点",
+      "(b) 半眼: 禅の伝統。視線を45度下方に落とし、約1m先の床にぼんやり焦点を置く",
+      "半眼は何も見ないのではなく、何も見ようとしない。眠気を防ぎ覚醒した観察を保ちやすい"
+    ]
+  },
+  {
+    num: "04", title: "3回の深呼吸 ── 入口", time: "30秒",
+    summary: "鼻からゆっくり吸って吐く × 3回 → 以降コントロールやめる",
+    details: [
+      "鼻から息をゆっくり吸い、鼻からゆっくり吐く",
+      "これを3回だけ行う。ここで体の緊張を解放し、瞑想モードへ移行する",
+      "3回終わったら、呼吸をコントロールするのをやめる",
+      "以降は、ただ自然な呼吸が起きるに任せる"
+    ]
+  },
+  {
+    num: "05", title: "数息観 ── 主行", time: "本体",
+    summary: "鼻呼吸、吐く息で1〜10、戻り、注意は鼻入口 or 丹田",
+    details: [
+      "呼吸は鼻で行う。腹を意識せず、強制せず、自然に",
+      "吐く息で1から数える: 「ひとーつ」「ふたーつ」… 心の中で。声には出さない",
+      "10まで数えたら、また1に戻る",
+      "注意の置き場所: 鼻の入口で空気が動く感覚 or 下腹部(丹田、臍下3cm程度)の上下動。最初は鼻の方がやりやすい",
+      "",
+      "【思考が起きたら ── ここが本番】",
+      "・必ず思考が湧く。「明日の会議」「腰がかゆい」── 全て当然",
+      "・抑え込まない(「考えるな」と戦うとかえって思考が増える)",
+      "・追わない(連想を広げない)",
+      "・「考えていた」と気づいた瞬間に、ただ呼吸の数に戻る ── これがメタ認知の発火、瞑想の本質",
+      "・気づいて戻ること自体が訓練。思考が出ること自体は失敗ではない",
+      "・数を見失ったら、1から数え直す",
+      "",
+      "【身体感覚への対処】",
+      "・痒み・かすかな痛み・しびれは原則動かさない(観察対象として呼吸と同列に扱う)",
+      "・ただし強い痛み(腰など)は別。姿勢を直す。我慢ではなく観察の訓練",
+      "",
+      "【Phase 3以降】",
+      "・隨息観: 数えずに呼吸を観察(鼻の入口の冷たい/温かい空気の質感)",
+      "・只管打坐: 呼吸という対象も手放し、生起する全ての経験を判断せず観察",
+      "・不安定な日は数息観に戻して構わない(伝統的な「足場の戻し方」)"
+    ]
+  },
+  {
+    num: "06", title: "終わり方", time: "30秒",
+    summary: "タイマー鳴ってもすぐ目を開けない / 10〜30秒ただ座る / 心の中で「よし」",
+    details: [
+      "タイマーが鳴ってもすぐに目を開けない",
+      "数息観をやめ、しばらくただ座る(10〜30秒)",
+      "ゆっくり目を開ける(閉じていた場合)、視野に光が戻る感覚を確認",
+      "軽く首・肩を動かす。立ち上がる前に足の感覚が戻っているか確認",
+      "celebration: 心の中で「よし」と言う、または小さく頷く ── 終わったことを明示的に承認"
+    ]
+  },
+  {
+    num: "07", title: "記録", time: "10秒",
+    summary: "本アプリで記録(本書原案: 最初の8週は時間記録せず○のみが推奨)",
+    details: [
+      "本書の原案: 「日付と○の二項目だけ追加する。それ以上の詳細記録(時間、感想、雑念の数)は最初の8週間は付けない。記録がメタ作業化して本体を圧迫するのを防ぐ」",
+      "本アプリは時間も記録する設計だが、メタ作業化(計画グラフを眺める時間が瞑想を超える等)に陥らないよう注意する"
+    ]
+  }
+];
+
+function MedProcedureModal({onClose}) {
+  const [exp, setExp] = useState(null);
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1100,padding:16}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#0f1419",borderRadius:20,padding:"22px 20px",maxWidth:480,width:"100%",border:"1px solid rgba(167,139,250,0.2)",maxHeight:"88vh",overflow:"auto",fontFamily:"'Shippori Mincho','Yu Mincho',serif"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,paddingBottom:14,borderBottom:`1px solid ${MED_COLOR}33`}}>
+          <div>
+            <div style={{color:MED_COLOR,fontSize:11,letterSpacing:"0.2em",fontStyle:"italic",marginBottom:4}}>SUSOKUKAN ── ZAZEN</div>
+            <h3 style={{color:"#fff",fontSize:18,fontWeight:500,margin:0,letterSpacing:"0.04em"}}>瞑想の手順</h3>
+          </div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"rgba(255,255,255,0.4)",fontSize:22,cursor:"pointer",padding:"0 4px"}}>×</button>
+        </div>
+        <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,marginBottom:14,lineHeight:1.7,fontFamily:"'Noto Sans JP',sans-serif"}}>
+          各ステップをタップで詳細展開。瞑想の直前にこのモーダルで確認してください。
+        </div>
+        {MED_PROCEDURE.map(step => {
+          const isExp = exp === step.num;
+          return (
+            <div key={step.num} style={{background:"rgba(255,255,255,0.025)",borderRadius:10,padding:"12px 14px",marginBottom:8,border:"1px solid rgba(255,255,255,0.05)",cursor:"pointer"}}
+                 onClick={()=>setExp(isExp?null:step.num)}>
+              <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:8}}>
+                <span style={{color:MED_COLOR,fontSize:11,fontStyle:"italic",letterSpacing:"0.15em"}}>{step.num}</span>
+                <span style={{color:"#fff",fontSize:14,fontWeight:500,flex:1}}>{step.title}</span>
+                <span style={{color:"rgba(255,255,255,0.3)",fontSize:10,fontStyle:"italic"}}>{step.time}</span>
+                <span style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginLeft:4}}>{isExp?"▾":"▸"}</span>
+              </div>
+              {step.summaryLines ? (
+                <ul style={{listStyle:"none",padding:0,margin:0,fontFamily:"'Noto Sans JP',sans-serif"}}>
+                  {step.summaryLines.map((line,i)=>(
+                    <li key={i} style={{color:"rgba(255,255,255,0.78)",fontSize:12,lineHeight:1.85,paddingLeft:14,position:"relative",marginBottom:3}}>
+                      <span style={{position:"absolute",left:0,color:MED_COLOR,fontWeight:700}}>·</span>
+                      {line}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div style={{color:"rgba(255,255,255,0.7)",fontSize:12,lineHeight:1.7,fontFamily:"'Noto Sans JP',sans-serif"}}>{step.summary}</div>
+              )}
+              {isExp && step.details && (
+                <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${MED_COLOR}22`,fontFamily:"'Noto Sans JP',sans-serif"}}>
+                  {step.details.map((line,i)=>(
+                    line === "" ? <div key={i} style={{height:6}}/> :
+                    <div key={i} style={{color:"rgba(255,255,255,0.55)",fontSize:11.5,lineHeight:1.85,marginBottom:4}}>{line}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        <button onClick={onClose} style={{width:"100%",background:"rgba(167,139,250,0.1)",color:MED_COLOR,border:`1px solid ${MED_COLOR}33`,borderRadius:10,padding:12,cursor:"pointer",fontSize:13,fontWeight:600,marginTop:8,fontFamily:"'Noto Sans JP',sans-serif"}}>閉じる</button>
+        <div style={{textAlign:"center",marginTop:14,color:"rgba(255,255,255,0.2)",fontSize:10,fontStyle:"italic",letterSpacing:"0.1em"}}>"Just sit." ── 道元</div>
+      </div>
+    </div>
+  );
+}
+
 // ═══ Tab 1: Plan ═══
 function PlanTab({state,persist}) {
   const [ed,setEd]=useState(null);
   const [bt,setBt]=useState("");const [bp,setBp]=useState("");const [bc,setBc]=useState("1.0");
+  const [showProc,setShowProc]=useState(false);
 
   function openNew(){setBt("");setBp("");setBc("1.0");setEd({id:gid(),name:"",cat:"other",pct:"",startDate:GS,books:[]});}
   function openEdit(f){setBt("");setBp("");setBc("1.0");setEd(JSON.parse(JSON.stringify(f)));}
@@ -467,7 +693,6 @@ function PlanTab({state,persist}) {
     setEd(null);
   }
 
-  // Date-aware analysis
   const overDays = useMemo(()=>findOverAllocDays(state.fields),[state.fields]);
   const underDays = useMemo(()=>findUnderAllocDays(state.fields),[state.fields]);
   const underSoon = useMemo(()=>{
@@ -490,6 +715,15 @@ function PlanTab({state,persist}) {
   },[ed]);
   const previewEff=ed?ed.books.reduce((s,b)=>s+bookEff(b),0):0;
 
+  // Meditation plan summary
+  const med=state.meditation||{startDate:MED_START_DEFAULT,sessions:{}};
+  const t=today();
+  const medPh=medPhase(t,med.startDate);
+  const medWk=medWeek(t,med.startDate);
+  const perSession=medPerSessionPlan(t,med.startDate);
+  const dailyTarget=medDailyPlan(t,med.startDate);
+  const defPractice=medDefaultPractice(t,med.startDate);
+
   return (
     <div>
       <div style={card}>
@@ -511,7 +745,6 @@ function PlanTab({state,persist}) {
         </div>
       </div>
 
-      {/* ── Warnings ── */}
       {overDays.length>0 && (
         <div style={{...card,borderColor:"rgba(248,113,113,0.3)",background:"linear-gradient(135deg,#1f1419,#1a1f2e)"}}>
           <div style={{color:"#f87171",fontSize:13,fontWeight:600,marginBottom:6}}>⚠️ 100%超過の日があります</div>
@@ -552,7 +785,6 @@ function PlanTab({state,persist}) {
         </div>
       )}
 
-      {/* ── Field list ── */}
       <div style={card}>
         <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600,marginBottom:8}}>分野一覧</div>
         {state.fields.map((f,i)=>{
@@ -596,7 +828,36 @@ function PlanTab({state,persist}) {
         <button onClick={openNew} style={{width:"100%",background:"rgba(255,255,255,0.04)",color:"rgba(255,255,255,0.4)",border:"1px dashed rgba(255,255,255,0.12)",borderRadius:12,padding:14,fontSize:13,cursor:"pointer",marginTop:8}}>+ 分野を追加</button>
       </div>
 
-      {/* ── Edit modal ── */}
+      {/* ═══ Meditation plan section ═══ */}
+      <div style={{marginTop:28,paddingTop:20,borderTop:`1px solid ${MED_COLOR}22`}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,padding:"0 4px"}}>
+          <span style={{fontSize:18}}>🧘</span>
+          <span style={{color:MED_COLOR,fontSize:13,fontWeight:600,letterSpacing:"0.04em"}}>瞑想プログラム</span>
+          <div style={{flex:1,height:1,background:`linear-gradient(90deg,${MED_COLOR}33,transparent)`}}/>
+        </div>
+
+        <div style={{...card,borderColor:`${MED_COLOR}22`,background:"linear-gradient(135deg,#0f0d18,#15131f)"}}>
+          <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,marginBottom:10}}>
+            開始: <span style={{color:MED_COLOR,fontWeight:600}}>{fF(med.startDate)}</span>
+            {medPh===0 && <span style={{marginLeft:8,color:"rgba(255,255,255,0.3)"}}>(あと{Math.max(0,diffD(t,med.startDate))}日)</span>}
+          </div>
+          <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.9}}>
+            <div>Phase 1 (Week 1-2): 5分 × 2 = 10分/日 (数息観)</div>
+            <div>Phase 2 (Week 3-8): 週1分ずつ延長 → 11分/回 × 2 (数息観)</div>
+            <div>Phase 3 (Week 9-16): 15分から週1分ずつ → 20分/回 × 2 (隨息観)</div>
+            <div>Phase 4 (Week 17~): 20分から週1分ずつ → 30分/回 × 2 (只管打坐)</div>
+          </div>
+          {medPh>0 && (
+            <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${MED_COLOR}22`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{color:MED_COLOR,fontSize:11,letterSpacing:"0.15em",fontStyle:"italic"}}>NOW · PHASE {medPh} · WEEK {medWk}</span>
+              <span style={{color:"#fff",fontSize:13,fontWeight:600}}>{perSession}分 × 2 = {dailyTarget}分/日 ({defPractice})</span>
+            </div>
+          )}
+        </div>
+
+        <button onClick={()=>setShowProc(true)} style={{width:"100%",background:`${MED_COLOR}1a`,color:MED_COLOR,border:`1px solid ${MED_COLOR}44`,borderRadius:12,padding:"14px",fontSize:13,fontWeight:600,cursor:"pointer",letterSpacing:"0.05em"}}>📖 瞑想の手順を表示（タップで展開）</button>
+      </div>
+
       {ed&&(
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
           <div style={{background:"#1a1f2e",borderRadius:20,padding:24,maxWidth:460,width:"100%",border:"1px solid rgba(255,255,255,0.1)",maxHeight:"88vh",overflow:"auto"}}>
@@ -645,6 +906,8 @@ function PlanTab({state,persist}) {
           </div>
         </div>
       )}
+
+      {showProc && <MedProcedureModal onClose={()=>setShowProc(false)}/>}
     </div>
   );
 }
@@ -657,8 +920,17 @@ function ChartTab({state}) {
   const compareData=useMemo(()=>buildDailyCompare(state,ff,hw),[state,ff,hw]);
   const paData=useMemo(()=>buildPlanActualChart(state,hw),[state,hw]);
   const cum=useMemo(()=>calcCum(state,ff),[state,ff]);
+  const medCompareData=useMemo(()=>buildMedDailyCompare(state,hw),[state,hw]);
   const sur=cum.pageDiff>=0;
   const tw=hw*2;
+
+  const t=today();
+  const med=state.meditation||{};
+  const medPh=medPhase(t,med.startDate);
+  const medWk=medWeek(t,med.startDate);
+  const perSession=medPerSessionPlan(t,med.startDate);
+  const dailyTarget=medDailyPlan(t,med.startDate);
+  const defPractice=medDefaultPractice(t,med.startDate);
 
   const fieldLegend=state.fields.map((f,i)=>(
     <div key={f.id} style={{display:"flex",alignItems:"center",gap:3}}>
@@ -679,7 +951,6 @@ function ChartTab({state}) {
         </div>
       </div>
 
-      {/* Cumulative */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:16}}>
         <div style={{...card,textAlign:"center",marginBottom:0,padding:14}}>
           <div style={{color:"rgba(255,255,255,0.35)",fontSize:10,marginBottom:2}}>累積{sur?"余剰":"不足"}</div>
@@ -703,7 +974,6 @@ function ChartTab({state}) {
         </div>
       </div>
 
-      {/* Range slider */}
       <div style={{...card,padding:"14px 22px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
           <span style={{color:"rgba(255,255,255,0.45)",fontSize:11}}>表示範囲</span>
@@ -716,7 +986,6 @@ function ChartTab({state}) {
         </div>
       </div>
 
-      {/* Chart 1: Plan vs Actual daily comparison */}
       <div style={{...card,padding:"14px 6px 6px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,padding:"0 16px"}}>
           <span style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600}}>計画 vs 実績（日別）</span>
@@ -738,7 +1007,6 @@ function ChartTab({state}) {
         <DailyCompareChart data={compareData} />
       </div>
 
-      {/* Chart 2: Plan/Actual */}
       <StackedChart days={paData} fields={state.fields} showCapLine={true}
         title="実績 + 予定（分野別積み上げ）"
         legend={<>
@@ -754,11 +1022,10 @@ function ChartTab({state}) {
         </>}
       />
 
-      {/* Per-field */}
       <div style={card}>
         <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>分野別</div>
         {state.fields.map((f,i)=>{
-          const te=fieldEff(f);const ae=logsEff(f,state.logs);const t=today();
+          const te=fieldEff(f);const ae=logsEff(f,state.logs);
           let latestD=t;Object.keys(state.logs).forEach(d=>{const arr=state.logs[d];if(Array.isArray(arr)&&arr.some(e=>e.fid===f.id)&&d>latestD)latestD=d;});
           let pln=0,d=f.startDate;while(d<=latestD&&pln<te){pln=Math.min(pln+fieldReq(f,d),te);d=addD(d,1);}
           const diff=ae-pln;const dayReq=fieldReq(f,t);const daysDiff=dayReq>0?(diff/dayReq):0;
@@ -771,14 +1038,327 @@ function ChartTab({state}) {
           );
         })}
       </div>
+
+      {/* ═══ Meditation chart section ═══ */}
+      <div style={{marginTop:28,paddingTop:20,borderTop:`1px solid ${MED_COLOR}22`}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,padding:"0 4px"}}>
+          <span style={{fontSize:18}}>🧘</span>
+          <span style={{color:MED_COLOR,fontSize:13,fontWeight:600,letterSpacing:"0.04em"}}>瞑想</span>
+          <div style={{flex:1,height:1,background:`linear-gradient(90deg,${MED_COLOR}33,transparent)`}}/>
+        </div>
+
+        <div style={{...card,borderColor:`${MED_COLOR}22`,background:"linear-gradient(135deg,#0f0d18,#15131f)"}}>
+          {medPh === 0 ? (
+            <div style={{textAlign:"center",padding:"8px 0"}}>
+              <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,marginBottom:6}}>瞑想プログラム開始予定日</div>
+              <div style={{color:MED_COLOR,fontSize:18,fontWeight:600}}>{fF(med.startDate)}</div>
+              <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:6}}>開始まであと {Math.max(0,diffD(t,med.startDate))} 日</div>
+            </div>
+          ) : (
+            <>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <div>
+                  <div style={{color:MED_COLOR,fontSize:11,letterSpacing:"0.15em",fontStyle:"italic",marginBottom:2}}>PHASE {medPh} · WEEK {medWk}</div>
+                  <div style={{color:"rgba(255,255,255,0.5)",fontSize:11}}>
+                    {medPh===1?"習慣の起点を作る":medPh===2?"時間を伸ばし姿勢を整える":medPh===3?"隨息観への移行":"オープン・モニタリング / 只管打坐"}
+                  </div>
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <div style={{color:"#fff",fontSize:20,fontWeight:700}}>{perSession}<span style={{fontSize:11,fontWeight:400}}>分</span> × 2<span style={{fontSize:11,fontWeight:400,color:"rgba(255,255,255,0.4)"}}>回</span></div>
+                  <div style={{color:MED_COLOR,fontSize:11,marginTop:2}}>= {dailyTarget}分/日</div>
+                </div>
+              </div>
+              <div style={{borderTop:"1px solid rgba(255,255,255,0.05)",paddingTop:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{color:"rgba(255,255,255,0.35)",fontSize:11}}>主な実践</span>
+                <span style={{color:MED_COLOR,fontSize:12,fontWeight:600}}>{defPractice}</span>
+              </div>
+            </>
+          )}
+        </div>
+
+        <div style={{...card,padding:"14px 6px 6px",borderColor:`${MED_COLOR}1a`}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,padding:"0 16px"}}>
+            <span style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600}}>瞑想 計画 vs 実績（日別）</span>
+            <div style={{display:"flex",gap:12,alignItems:"center"}}>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <div style={{width:10,height:10,borderRadius:2,background:"rgba(255,255,255,0.15)"}}/>
+                <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>計画</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <div style={{width:10,height:10,borderRadius:2,background:MED_COLOR}}/>
+                <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>達成</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <div style={{width:10,height:10,borderRadius:2,background:"#f87171"}}/>
+                <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>未達</span>
+              </div>
+            </div>
+          </div>
+          <DailyCompareChart data={medCompareData} successColor={MED_COLOR}/>
+          <div style={{padding:"4px 16px 8px",color:"rgba(255,255,255,0.25)",fontSize:10,textAlign:"right"}}>
+            単位: 分/日
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
 
-// ═══ Tab 3: Daily ═══
+// ═══ Meditation section (used inside DailyTab) ═══
+function MeditationSection({state, persist, vd, openProc}) {
+  const [slot,setSlot]=useState(MED_SLOTS[0]);
+  const [practice,setPractice]=useState(null);
+  const [dur,setDur]=useState("");
+  const [ei,setEi]=useState(null);
+  const [celebrate,setCelebrate]=useState(false);
+
+  const med=state.meditation||{startDate:MED_START_DEFAULT,sessions:{}};
+  const t=today();
+  const isToday=vd===t;
+  const beforeStart=vd<med.startDate;
+  const phase=medPhase(vd,med.startDate);
+  const week=medWeek(vd,med.startDate);
+  const perSession=medPerSessionPlan(vd,med.startDate);
+  const dailyTarget=medDailyPlan(vd,med.startDate);
+  const defPractice=medDefaultPractice(vd,med.startDate);
+  const sessions=Array.isArray(med.sessions[vd])?med.sessions[vd]:[];
+  const totalActual=sessions.reduce((s,x)=>s+(x.duration||0),0);
+  const pct=dailyTarget>0?Math.min(totalActual/dailyTarget*100,100):(totalActual>0?100:0);
+
+  const missAlert=useMemo(()=>isToday?medCheckMissTwice(med):null,[med,isToday]);
+
+  const reset=useCallback(()=>{setSlot(MED_SLOTS[0]);setPractice(null);setDur("");setEi(null);},[]);
+
+  // 編集開始時にフォーム値を反映
+  useEffect(()=>{
+    if(ei!==null && sessions[ei]){
+      const e=sessions[ei];
+      setSlot(e.slot||MED_SLOTS[0]);
+      setPractice(e.practice||defPractice);
+      setDur(String(e.duration||""));
+    }
+  // eslint-disable-next-line
+  },[ei]);
+
+  // 日付が変わったときフォームをリセット
+  useEffect(()=>{reset();},[vd,reset]);
+
+  function startEd(idx){
+    setEi(idx);
+  }
+
+  function saveSession(){
+    const d=parseInt(dur);if(!d||d<=0)return;
+    const ns=JSON.parse(JSON.stringify(state));
+    if(!ns.meditation) ns.meditation={startDate:MED_START_DEFAULT,sessions:{}};
+    if(!ns.meditation.sessions) ns.meditation.sessions={};
+    if(!ns.meditation.sessions[vd]) ns.meditation.sessions[vd]=[];
+    const entry={slot,practice:practice||defPractice,duration:d};
+    const isNew = ei===null;
+    if(ei!==null && ei<ns.meditation.sessions[vd].length){
+      ns.meditation.sessions[vd][ei]=entry;
+    } else {
+      ns.meditation.sessions[vd].push(entry);
+    }
+    persist(ns);
+    reset();
+    if(isNew){
+      setCelebrate(true);
+      setTimeout(()=>setCelebrate(false),1600);
+    }
+  }
+
+  function delSession(idx){
+    const ns=JSON.parse(JSON.stringify(state));
+    if(!ns.meditation || !ns.meditation.sessions || !Array.isArray(ns.meditation.sessions[vd])) return;
+    ns.meditation.sessions[vd].splice(idx,1);
+    if(ns.meditation.sessions[vd].length===0) delete ns.meditation.sessions[vd];
+    persist(ns);
+    reset();
+  }
+
+  function quickMin(){
+    const ns=JSON.parse(JSON.stringify(state));
+    if(!ns.meditation) ns.meditation={startDate:MED_START_DEFAULT,sessions:{}};
+    if(!ns.meditation.sessions) ns.meditation.sessions={};
+    if(!ns.meditation.sessions[vd]) ns.meditation.sessions[vd]=[];
+    ns.meditation.sessions[vd].push({slot,practice:practice||defPractice,duration:1,minimum:true});
+    persist(ns);
+    reset();
+    setCelebrate(true);
+    setTimeout(()=>setCelebrate(false),1600);
+  }
+
+  const slotColor={"朝":"#fbbf24","夜":"#818cf8","その他":"#9ca3af"};
+
+  return (
+    <div style={{marginTop:28,paddingTop:20,borderTop:`1px solid ${MED_COLOR}22`,position:"relative"}}>
+      {celebrate && (
+        <div style={{
+          position:"absolute",top:30,left:"50%",transform:"translateX(-50%)",zIndex:20,
+          background:`${MED_COLOR}cc`,color:"#1a0f2e",padding:"12px 28px",borderRadius:14,
+          fontSize:18,fontWeight:700,letterSpacing:"0.1em",fontFamily:"'Shippori Mincho','Yu Mincho',serif",
+          boxShadow:`0 8px 32px ${MED_COLOR}66`,
+          animation:"medFade 1.6s ease-out forwards"
+        }}>よし</div>
+      )}
+      <style>{`@keyframes medFade{0%{opacity:0;transform:translate(-50%,8px) scale(0.92)}15%{opacity:1;transform:translate(-50%,0) scale(1)}75%{opacity:1}100%{opacity:0;transform:translate(-50%,-4px) scale(1)}}`}</style>
+
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,padding:"0 4px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:18}}>🧘</span>
+          <span style={{color:MED_COLOR,fontSize:13,fontWeight:600,letterSpacing:"0.04em"}}>瞑想</span>
+        </div>
+        <button onClick={openProc} style={{background:`${MED_COLOR}1a`,color:MED_COLOR,border:`1px solid ${MED_COLOR}33`,borderRadius:8,padding:"6px 12px",fontSize:11,fontWeight:600,cursor:"pointer"}}>📖 手順を表示</button>
+      </div>
+
+      <div style={{...card,borderColor:`${MED_COLOR}22`,background:"linear-gradient(135deg,#0f0d18,#15131f)"}}>
+        {beforeStart ? (
+          <div style={{textAlign:"center",padding:"6px 0"}}>
+            <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,marginBottom:6}}>瞑想プログラム開始日</div>
+            <div style={{color:MED_COLOR,fontSize:16,fontWeight:600}}>{fF(med.startDate)}</div>
+            <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:4}}>(この日付は開始前のため計画線なし。記録は可能)</div>
+          </div>
+        ) : (
+          <>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div>
+                <div style={{color:MED_COLOR,fontSize:11,letterSpacing:"0.15em",fontStyle:"italic",marginBottom:2}}>PHASE {phase} · WEEK {week}</div>
+                <div style={{color:"rgba(255,255,255,0.5)",fontSize:11}}>
+                  {phase===1?"習慣の起点を作る":phase===2?"時間を伸ばし姿勢を整える":phase===3?"隨息観への移行":"オープン・モニタリング / 只管打坐"}
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{color:"#fff",fontSize:18,fontWeight:700}}>{perSession}<span style={{fontSize:10,fontWeight:400}}>分</span> × 2</div>
+                <div style={{color:MED_COLOR,fontSize:11,marginTop:2}}>= {dailyTarget}分/日</div>
+              </div>
+            </div>
+            <div style={{borderTop:"1px solid rgba(255,255,255,0.05)",paddingTop:8,marginTop:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{color:"rgba(255,255,255,0.35)",fontSize:11}}>主な実践</span>
+              <span style={{color:MED_COLOR,fontSize:12,fontWeight:600}}>{defPractice}</span>
+            </div>
+          </>
+        )}
+      </div>
+
+      {missAlert && (
+        <div style={{...card,borderColor:missAlert.level==="red"?"rgba(248,113,113,0.4)":"rgba(251,191,36,0.3)",background:missAlert.level==="red"?"linear-gradient(135deg,#1f1419,#1a1f2e)":"linear-gradient(135deg,#1f1a14,#1a1f2e)"}}>
+          <div style={{color:missAlert.level==="red"?"#f87171":"#fbbf24",fontSize:12,fontWeight:600}}>
+            {missAlert.level==="red"?"🚨":"⚠️"} {missAlert.text}
+          </div>
+        </div>
+      )}
+
+      {!beforeStart && (
+        <div style={{...card,borderColor:`${MED_COLOR}1a`}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>進捗</span>
+            <span style={{color:totalActual>=dailyTarget?MED_COLOR:"#fff",fontSize:18,fontWeight:700}}>
+              {totalActual}<span style={{fontSize:11,fontWeight:400,color:"rgba(255,255,255,0.4)"}}>/{dailyTarget}</span>
+              <span style={{fontSize:11,fontWeight:400,color:"rgba(255,255,255,0.4)"}}> 分</span>
+            </span>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{flex:1,background:"rgba(255,255,255,0.06)",borderRadius:6,height:8,overflow:"hidden"}}>
+              <div style={{width:`${pct}%`,height:"100%",background:pct>=100?MED_COLOR:`linear-gradient(90deg,${MED_COLOR}aa,${MED_COLOR})`,borderRadius:6}}/>
+            </div>
+            <span style={{color:pct>=100?MED_COLOR:"#fff",fontSize:13,fontWeight:700}}>{pct.toFixed(0)}%</span>
+          </div>
+          <div style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginTop:6,textAlign:"right"}}>
+            {sessions.length}回 記録済み
+          </div>
+        </div>
+      )}
+
+      <div style={{...card,borderColor:`${MED_COLOR}1a`}}>
+        <div style={{color:MED_COLOR,fontSize:12,fontWeight:600,marginBottom:10}}>
+          {ei!==null?"📝 セッションを編集":"✏️ セッションを記録"}
+        </div>
+
+        <label style={lb}>スロット</label>
+        <div style={{display:"flex",gap:6,marginBottom:10}}>
+          {MED_SLOTS.map(s=>(
+            <button key={s} onClick={()=>setSlot(s)} style={{
+              flex:1,
+              background:slot===s?`${slotColor[s]}22`:"rgba(255,255,255,0.04)",
+              color:slot===s?slotColor[s]:"rgba(255,255,255,0.5)",
+              border:`1px solid ${slot===s?slotColor[s]+"55":"rgba(255,255,255,0.08)"}`,
+              borderRadius:8,padding:"8px 10px",fontSize:12,cursor:"pointer",fontWeight:slot===s?600:400
+            }}>{s}</button>
+          ))}
+        </div>
+
+        <label style={lb}>実践 <span style={{color:"rgba(255,255,255,0.25)",fontSize:10,fontWeight:400}}>(デフォルト: {defPractice})</span></label>
+        <div style={{display:"flex",gap:6,marginBottom:10}}>
+          {MED_PRACTICES.map(p=>{
+            const sel=(practice||defPractice)===p;
+            return (
+              <button key={p} onClick={()=>setPractice(p)} style={{
+                flex:1,
+                background:sel?`${MED_COLOR}22`:"rgba(255,255,255,0.04)",
+                color:sel?MED_COLOR:"rgba(255,255,255,0.5)",
+                border:`1px solid ${sel?MED_COLOR+"55":"rgba(255,255,255,0.08)"}`,
+                borderRadius:8,padding:"8px 6px",fontSize:11,cursor:"pointer",fontWeight:sel?600:400
+              }}>{p}</button>
+            );
+          })}
+        </div>
+
+        <label style={lb}>時間（分）</label>
+        <input type="number" value={dur} onChange={e=>setDur(e.target.value)} placeholder={`例: ${perSession||5}`}
+          style={{...inp,fontSize:18,fontWeight:700,padding:"10px 14px"}} onKeyDown={e=>{if(e.key==="Enter")saveSession();}}/>
+
+        <div style={{display:"flex",gap:8,marginTop:12}}>
+          {ei!==null && <button onClick={reset} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13}}>キャンセル</button>}
+          <button onClick={saveSession} disabled={!dur||parseInt(dur)<=0} style={{
+            flex:2,
+            background:dur&&parseInt(dur)>0?MED_COLOR:"rgba(255,255,255,0.04)",
+            color:dur&&parseInt(dur)>0?"#1a0f2e":"rgba(255,255,255,0.2)",
+            border:"none",borderRadius:10,padding:12,
+            cursor:dur&&parseInt(dur)>0?"pointer":"default",
+            fontSize:14,fontWeight:700
+          }}>{ei!==null?"更新":"記録する"}</button>
+        </div>
+
+        {ei===null && (
+          <button onClick={quickMin} style={{width:"100%",background:"rgba(255,255,255,0.03)",color:"rgba(255,255,255,0.4)",border:"1px dashed rgba(255,255,255,0.1)",borderRadius:8,padding:8,fontSize:11,cursor:"pointer",marginTop:8}}>
+            最低ライン達成（3呼吸 ≈ 1分）
+          </button>
+        )}
+      </div>
+
+      {sessions.length>0 && (
+        <div style={{...card,borderColor:`${MED_COLOR}1a`}}>
+          <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>📝 {fS(vd)} のセッション</div>
+          {sessions.map((s,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+              <div style={{flex:1,minWidth:0,display:"flex",alignItems:"center",gap:8}}>
+                <span style={{
+                  background:`${slotColor[s.slot]||"#9ca3af"}22`,
+                  color:slotColor[s.slot]||"#9ca3af",
+                  padding:"2px 8px",borderRadius:6,fontSize:10,fontWeight:600,minWidth:36,textAlign:"center"
+                }}>{s.slot||"?"}</span>
+                <span style={{color:MED_COLOR,fontSize:11}}>{s.practice||"-"}</span>
+                {s.minimum && <span style={{color:"rgba(255,255,255,0.3)",fontSize:9,fontStyle:"italic"}}>(最低ライン)</span>}
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                <span style={{color:"rgba(255,255,255,0.7)",fontSize:13,fontWeight:600}}>{s.duration}<span style={{fontSize:10,fontWeight:400,color:"rgba(255,255,255,0.4)"}}>分</span></span>
+                <button onClick={()=>startEd(i)} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.4)",border:"none",borderRadius:6,padding:"3px 8px",fontSize:10,cursor:"pointer"}}>編集</button>
+                <button onClick={()=>delSession(i)} style={{background:"rgba(248,113,113,0.08)",color:"#f87171",border:"none",borderRadius:6,padding:"3px 8px",fontSize:10,cursor:"pointer"}}>削除</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══ Tab 3: Daily Record (study + meditation) ═══
 function DailyTab({state,persist}) {
   const [vd,setVd]=useState(today());
   const [sf,setSf]=useState(null);const [sb,setSb]=useState(null);const [pg,setPg]=useState("");const [ei,setEi]=useState(null);
+  const [showProc,setShowProc]=useState(false);
   const reset=()=>{setSb(null);setPg("");setEi(null);};
   const go=(d)=>{setVd(d);reset();};
   const dReq=dailyReq(vd);
@@ -827,9 +1407,10 @@ function DailyTab({state,persist}) {
         <button onClick={()=>go(addD(vd,1))} style={{background:"rgba(255,255,255,0.08)",color:"#fff",border:"none",borderRadius:10,padding:"10px 16px",cursor:"pointer",fontSize:16,flexShrink:0}}>▶</button>
       </div>
 
+      {/* ── Study section ── */}
       <div style={card}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-          <span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>ノルマ</span>
+          <span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>📚 勉強ノルマ</span>
           <span style={{color:"#fbbf24",fontSize:22,fontWeight:700}}>{dReq.toFixed(1)}<span style={{fontSize:12,fontWeight:400}}> 実質p</span></span>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
@@ -871,7 +1452,7 @@ function DailyTab({state,persist}) {
       </div>
 
       <div style={card}>
-        <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600,marginBottom:10}}>{ei!==null?"📝 編集":"✏️ 追加"}</div>
+        <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600,marginBottom:10}}>{ei!==null?"📝 編集":"✏️ 勉強記録"}</div>
         <label style={lb}>分野</label>
         <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>
           {state.fields.map((f,i)=>(
@@ -914,7 +1495,7 @@ function DailyTab({state,persist}) {
 
       {dl.length>0&&(
         <div style={card}>
-          <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>📝 {fS(vd)} の記録</div>
+          <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>📝 {fS(vd)} の勉強記録</div>
           {dl.map((e,i)=>{
             const f=state.fields.find(x=>x.id===e.fid);const b=f?.books.find(x=>x.id===e.bid);
             const fi=f?state.fields.indexOf(f):0;const eff=e.pg*(b?.coeff||1);
@@ -935,11 +1516,16 @@ function DailyTab({state,persist}) {
           })}
         </div>
       )}
+
+      {/* ── Meditation section ── */}
+      <MeditationSection state={state} persist={persist} vd={vd} openProc={()=>setShowProc(true)}/>
+
+      {showProc && <MedProcedureModal onClose={()=>setShowProc(false)}/>}
     </div>
   );
 }
 
-// ═══ Main ═══
+// ═══ Main App ═══
 function App() {
   const [st,setSt]=useState(DEF);const [ld,setLd]=useState(true);const [tab,setTab]=useState("daily");
   const [importText,setImportText]=useState("");
@@ -947,28 +1533,37 @@ function App() {
   const [dataEmpty,setDataEmpty]=useState(false);
   const [showCopyDone,setShowCopyDone]=useState(false);
   const [showAdvSync,setShowAdvSync]=useState(false);
-  const [cloudStatus,setCloudStatus]=useState(""); // ""/"syncing"/"ok"/"error"
+  const [cloudStatus,setCloudStatus]=useState("");
 
   useEffect(()=>{
     (async()=>{
       const d=await load();
-      if(d&&d.fields&&d.fields.length>0){setSt(d);setDataEmpty(false);}
+      if(d&&d.fields&&d.fields.length>0){setSt(migrateMed(d));setDataEmpty(false);}
+      else if(d&&migrateMed(d).meditation&&Object.keys(migrateMed(d).meditation.sessions||{}).length>0){
+        // 勉強分野はないが瞑想記録はある場合
+        setSt(migrateMed(d));setDataEmpty(false);
+      }
       else{setDataEmpty(true);}
       setLd(false);
     })();
   },[]);
 
   const ps=useCallback(ns=>{
-    setSt(ns);save(ns);
-    setDataEmpty(!ns.fields||ns.fields.length===0);
+    const migrated=migrateMed(ns);
+    setSt(migrated);save(migrated);
+    setDataEmpty(!migrated.fields||migrated.fields.length===0);
+    // 瞑想記録があればdataEmpty=falseに
+    if(migrated.meditation && migrated.meditation.sessions && Object.keys(migrated.meditation.sessions).length>0){
+      setDataEmpty(false);
+    }
     setCloudStatus("syncing");
-    saveCloud(ns).then(ok=>{setCloudStatus(ok?"ok":"error");setTimeout(()=>setCloudStatus(""),3000);});
+    saveCloud(migrated).then(ok=>{setCloudStatus(ok?"ok":"error");setTimeout(()=>setCloudStatus(""),3000);});
   },[]);
 
   async function pullCloud2(){
     setCloudStatus("syncing");setSyncMsg("");
     const d=await loadCloud();
-    if(d&&d.fields){setSt(d);saveLocal(d);setCloudStatus("ok");setSyncMsg("✅ クラウドから取得しました");setDataEmpty(false);}
+    if(d&&d.fields!==undefined){const m=migrateMed(d);setSt(m);saveLocal(m);setCloudStatus("ok");setSyncMsg("✅ クラウドから取得しました");setDataEmpty(false);}
     else{setCloudStatus("error");setSyncMsg("❌ 取得失敗。接続を確認してください。");}
     setTimeout(()=>{setCloudStatus("");setSyncMsg("");},4000);
   }
@@ -989,7 +1584,7 @@ function App() {
   }
 
   function doRestore(){
-    try{const data=JSON.parse(importText);if(!data.fields)throw new Error("invalid");if(!data.logs)data.logs={};ps(data);setSyncMsg("✅ データを復元しました！");setImportText("");setDataEmpty(false);setTimeout(()=>setSyncMsg(""),3000);}
+    try{const data=JSON.parse(importText);if(!data.fields)throw new Error("invalid");if(!data.logs)data.logs={};ps(migrateMed(data));setSyncMsg("✅ データを復元しました！");setImportText("");setDataEmpty(false);setTimeout(()=>setSyncMsg(""),3000);}
     catch{setSyncMsg("❌ データ形式が正しくありません。");}
   }
 
@@ -1002,12 +1597,12 @@ function App() {
         <div style={{maxWidth:540,margin:"0 auto",padding:"40px 16px"}}>
           <div style={{textAlign:"center",marginBottom:32}}>
             <div style={{fontSize:48,marginBottom:12}}>📚</div>
-            <h1 style={{color:"#fff",fontSize:22,fontWeight:700,margin:"0 0 8px"}}>勉強計画トラッカー</h1>
+            <h1 style={{color:"#fff",fontSize:22,fontWeight:700,margin:"0 0 8px"}}>勉強+瞑想 計画トラッカー</h1>
             <p style={{color:"rgba(255,255,255,0.4)",fontSize:13,lineHeight:1.7}}>データが見つかりません。</p>
           </div>
           <div style={{...card,borderColor:"rgba(74,222,128,0.2)"}}>
             <div style={{color:"#4ade80",fontSize:14,fontWeight:600,marginBottom:10}}>☁️ Google Docsから復元</div>
-            <button onClick={async()=>{setSyncMsg("⏳ 取得中...");const d=await loadCloud();if(d&&d.fields&&d.fields.length>0){setSt(d);saveLocal(d);setDataEmpty(false);setSyncMsg("✅ 復元しました！");}else{setSyncMsg("❌ データが見つかりませんでした。");}}} style={{width:"100%",background:"#4ade80",color:"#000",border:"none",borderRadius:10,padding:"14px",fontSize:14,fontWeight:700,cursor:"pointer"}}>☁️ クラウドから復元</button>
+            <button onClick={async()=>{setSyncMsg("⏳ 取得中...");const d=await loadCloud();if(d&&d.fields&&d.fields.length>0){const m=migrateMed(d);setSt(m);saveLocal(m);setDataEmpty(false);setSyncMsg("✅ 復元しました！");}else{setSyncMsg("❌ データが見つかりませんでした。");}}} style={{width:"100%",background:"#4ade80",color:"#000",border:"none",borderRadius:10,padding:"14px",fontSize:14,fontWeight:700,cursor:"pointer"}}>☁️ クラウドから復元</button>
           </div>
           <div style={{...card,borderColor:"rgba(129,140,248,0.2)"}}>
             <div style={{color:"#818cf8",fontSize:14,fontWeight:600,marginBottom:10}}>📥 手動で復元</div>
@@ -1028,7 +1623,7 @@ function App() {
       <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
       <div style={{maxWidth:540,margin:"0 auto",padding:"16px 16px 120px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-          <h1 style={{color:"#fff",fontSize:18,fontWeight:700,margin:0}}>📚 勉強計画トラッカー</h1>
+          <h1 style={{color:"#fff",fontSize:17,fontWeight:700,margin:0}}>📚 勉強+瞑想 トラッカー</h1>
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
             <span style={{fontSize:9,color:cloudStatus==="ok"?"#4ade80":cloudStatus==="syncing"?"#fbbf24":cloudStatus==="error"?"#f87171":"rgba(255,255,255,0.2)"}}>
               {cloudStatus==="syncing"?"⏳":cloudStatus==="ok"?"☁️✓":cloudStatus==="error"?"☁️✗":"☁️"}
@@ -1059,7 +1654,7 @@ function App() {
         )}
 
         <div style={{display:"flex",gap:4,marginBottom:20,background:"rgba(255,255,255,0.03)",borderRadius:12,padding:3}}>
-          {[{id:"plan",l:"計画入力",ic:"📋"},{id:"chart",l:"計画表示",ic:"📊"},{id:"daily",l:"今日の勉強",ic:"✏️"}].map(t=>(
+          {[{id:"plan",l:"計画入力",ic:"📋"},{id:"chart",l:"計画表示",ic:"📊"},{id:"daily",l:"今日の記録",ic:"✏️"}].map(t=>(
             <button key={t.id} onClick={()=>setTab(t.id)} style={{
               flex:1,background:tab===t.id?"rgba(255,255,255,0.08)":"transparent",
               border:"none",borderRadius:9,padding:"10px 4px",
@@ -1074,7 +1669,7 @@ function App() {
         {tab==="daily"&&<DailyTab state={st} persist={ps}/>}
       </div>
 
-      {st.fields.length>0 && (
+      {(st.fields.length>0 || (st.meditation && Object.keys(st.meditation.sessions||{}).length>0)) && (
         <div style={{position:"fixed",bottom:0,left:0,right:0,background:"linear-gradient(0deg,#0a0e14 60%,transparent)",padding:"16px 16px 12px"}}>
           <div style={{maxWidth:540,margin:"0 auto",display:"flex",gap:8}}>
             <button onClick={pushCloud2} disabled={cloudStatus==="syncing"} style={{

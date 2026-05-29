@@ -124,7 +124,7 @@ function summarizeRanges(days) {
 }
 
 // ═══ Meditation calc ═══
-// Phase 1 (Week 1-2): 5分/回 × 2 = 10分/日
+// Phase 1 (Week 1-2): 5分/回 × 1 = 5分/日
 // Phase 2 (Week 3-8): 週1分ずつ延長, w8で11分/回 (上限15分)
 // Phase 3 (Week 9-16): 15分/回スタート、週1分ずつ延長、w14で20分(以降cap)
 // Phase 4 (Week 17~): 20分/回スタート、週1分ずつ延長、w27で30分(以降cap)
@@ -150,7 +150,7 @@ function medPerSessionPlan(date, startDate) {
   return Math.min(20 + (w - 17), 30);
 }
 function medDailyPlan(date, startDate) {
-  return medPerSessionPlan(date, startDate) * 2;
+  return medPerSessionPlan(date, startDate) * 1;
 }
 function medDefaultPractice(date, startDate) {
   const p = medPhase(date, startDate);
@@ -842,15 +842,15 @@ function PlanTab({state,persist}) {
             {medPh===0 && <span style={{marginLeft:8,color:"rgba(255,255,255,0.3)"}}>(あと{Math.max(0,diffD(t,med.startDate))}日)</span>}
           </div>
           <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.9}}>
-            <div>Phase 1 (Week 1-2): 5分 × 2 = 10分/日 (数息観)</div>
-            <div>Phase 2 (Week 3-8): 週1分ずつ延長 → 11分/回 × 2 (数息観)</div>
-            <div>Phase 3 (Week 9-16): 15分から週1分ずつ → 20分/回 × 2 (隨息観)</div>
-            <div>Phase 4 (Week 17~): 20分から週1分ずつ → 30分/回 × 2 (只管打坐)</div>
+            <div>Phase 1 (Week 1-2): 5分 × 1 = 5分/日 (数息観)</div>
+            <div>Phase 2 (Week 3-8): 週1分ずつ延長 → 11分/回 × 1 (数息観)</div>
+            <div>Phase 3 (Week 9-16): 15分から週1分ずつ → 20分/回 × 1 (隨息観)</div>
+            <div>Phase 4 (Week 17~): 20分から週1分ずつ → 30分/回 × 1 (只管打坐)</div>
           </div>
           {medPh>0 && (
             <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${MED_COLOR}22`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
               <span style={{color:MED_COLOR,fontSize:11,letterSpacing:"0.15em",fontStyle:"italic"}}>NOW · PHASE {medPh} · WEEK {medWk}</span>
-              <span style={{color:"#fff",fontSize:13,fontWeight:600}}>{perSession}分 × 2 = {dailyTarget}分/日 ({defPractice})</span>
+              <span style={{color:"#fff",fontSize:13,fontWeight:600}}>{perSession}分 × 1 = {dailyTarget}分/日 ({defPractice})</span>
             </div>
           )}
         </div>
@@ -1064,7 +1064,7 @@ function ChartTab({state}) {
                   </div>
                 </div>
                 <div style={{textAlign:"right"}}>
-                  <div style={{color:"#fff",fontSize:20,fontWeight:700}}>{perSession}<span style={{fontSize:11,fontWeight:400}}>分</span> × 2<span style={{fontSize:11,fontWeight:400,color:"rgba(255,255,255,0.4)"}}>回</span></div>
+                  <div style={{color:"#fff",fontSize:20,fontWeight:700}}>{perSession}<span style={{fontSize:11,fontWeight:400}}>分</span> × 1<span style={{fontSize:11,fontWeight:400,color:"rgba(255,255,255,0.4)"}}>回</span></div>
                   <div style={{color:MED_COLOR,fontSize:11,marginTop:2}}>= {dailyTarget}分/日</div>
                 </div>
               </div>
@@ -1229,7 +1229,7 @@ function MeditationSection({state, persist, vd, openProc}) {
                 </div>
               </div>
               <div style={{textAlign:"right"}}>
-                <div style={{color:"#fff",fontSize:18,fontWeight:700}}>{perSession}<span style={{fontSize:10,fontWeight:400}}>分</span> × 2</div>
+                <div style={{color:"#fff",fontSize:18,fontWeight:700}}>{perSession}<span style={{fontSize:10,fontWeight:400}}>分</span> × 1</div>
                 <div style={{color:MED_COLOR,fontSize:11,marginTop:2}}>= {dailyTarget}分/日</div>
               </div>
             </div>

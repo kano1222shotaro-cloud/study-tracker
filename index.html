@@ -16,13 +16,16 @@ body{background:#0a0e14;font-family:'Noto Sans JP','Hiragino Sans',sans-serif;-w
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const {useState,useEffect,useCallback,useMemo}=React;
+const {useState,useEffect,useCallback,useMemo,useRef}=React;
 
 // ═══ Constants (Study) ═══
 const GS = "2026-03-23";
 const RAMP = 140;
 const B0 = 1, B1 = 50;
 const INCR = (B1 - B0) / (RAMP - 1);
+// 平日/休日の1日あたり増加率（休日は1.5倍）。目標変更時のランプにも使用。
+const WEEKDAY_INCR = INCR;
+const WEEKEND_INCR = INCR * 1.5;
 
 // ═══ Constants (Meditation) ═══
 const MED_START_DEFAULT = "2026-05-05";
@@ -42,21 +45,71 @@ function fS(s) { const d=parseD(s); return `${d.getMonth()+1}/${d.getDate()}`; }
 function dw(s) { return ["日","月","火","水","木","金","土"][parseD(s).getDay()]; }
 const gid=()=>Math.random().toString(36).slice(2,10);
 
-// ═══ Core calc (Study) ═══
-function dailyReq(date) {
-  const n=diffD(GS,date)+1; if(n<=0) return 0;
-  const base=n<=RAMP?B0+(n-1)*INCR:B1;
-  return isWe(date)?base*1.5:base;
+// ═══ Schedule (Study) ═══
+// 1日ノルマ(全分野合計)は「セグメント」の列で表される。
+// 各セグメントは from(適用開始日)・weekday/weekend(平日/休日の目標=上限)・
+// seedW/seedH(直近同種日の値と日付)を持つ。
+// ある日 d のノルマ = min(上限, seed.val + 増加率 × (dとseed.dateの経過日数))。
+// genesis セグメントは現行 dailyReq を完全再現する(平日上限50/休日75, seed=GSで1/1.5)。
+const GENESIS_SEG = { from: GS, weekday: B1, weekend: B1 * 1.5, seedW: { date: GS, val: B0 }, seedH: { date: GS, val: B0 * 1.5 } };
+function genesisStudySched() { return { past: [], current: [ JSON.parse(JSON.stringify(GENESIS_SEG)) ], future: [] }; }
+function getSegs(state) {
+  const c = state && state.studySchedule && Array.isArray(state.studySchedule.current) && state.studySchedule.current.length
+    ? state.studySchedule.current : null;
+  return c || [ GENESIS_SEG ];
 }
-function fieldReq(f,date) { if(!f.pct||date<f.startDate) return 0; return dailyReq(date)*(f.pct/100); }
+function activeSeg(segs, date) {
+  for (let i = segs.length - 1; i >= 0; i--) { if (segs[i].from <= date) return segs[i]; }
+  return null;
+}
+
+// ═══ Core calc (Study) ═══
+// dailyReq は segs(セグメント配列)を受け取る。省略時は genesis(現行挙動)。
+function dailyReq(date, segs) {
+  const n = diffD(GS, date) + 1; if (n <= 0) return 0;
+  const s = segs || [ GENESIS_SEG ];
+  const seg = activeSeg(s, date);
+  if (!seg) return 0;
+  if (isWe(date)) {
+    return Math.min(seg.weekend, seg.seedH.val + WEEKEND_INCR * diffD(seg.seedH.date, date));
+  }
+  return Math.min(seg.weekday, seg.seedW.val + WEEKDAY_INCR * diffD(seg.seedW.date, date));
+}
+function fieldReq(f, date, segs) { if (!f.pct || date < f.startDate) return 0; return dailyReq(date, segs) * (f.pct / 100); }
 function bookEff(b) { const tp=b.disabled?Math.min(b.pagesRead||0,b.totalPages):b.totalPages; return tp*(b.coeff||1); }
 function fieldEff(f) { return f.books.reduce((s,b)=>s+bookEff(b),0); }
-function fieldEnd(f) {
+function fieldEnd(f, segs) {
   const tot=fieldEff(f); if(tot<=0||!f.pct) return null;
   let cum=0,d=f.startDate;
-  for(let i=0;i<3650;i++){cum+=fieldReq(f,d);if(cum>=tot)return d;d=addD(d,1);}
+  for(let i=0;i<3650;i++){cum+=fieldReq(f,d,segs);if(cum>=tot)return d;d=addD(d,1);}
   return d;
 }
+
+// 目標変更を適用(今日から)。過去は seed として凍結。undo/redo 用に past/future 更新。
+function applyStudyTarget(state, weekdayCap, weekendCap) {
+  const sched = state.studySchedule && Array.isArray(state.studySchedule.current) && state.studySchedule.current.length
+    ? state.studySchedule : genesisStudySched();
+  const segs = sched.current;
+  const C = today();
+  let dw = addD(C, -1); while (isWe(dw)) dw = addD(dw, -1);
+  let dh = addD(C, -1); while (!isWe(dh)) dh = addD(dh, -1);
+  const vw = dailyReq(dw, segs);
+  const vh = dailyReq(dh, segs);
+  const newSeg = { from: C, weekday: weekdayCap, weekend: weekendCap, seedW: { date: dw, val: vw }, seedH: { date: dh, val: vh } };
+  const last = segs[segs.length - 1];
+  const newCurrent = (last && last.from === C) ? [ ...segs.slice(0, -1), newSeg ] : [ ...segs, newSeg ];
+  return { ...state, studySchedule: { past: [ ...sched.past, segs ], current: newCurrent, future: [] } };
+}
+function studyUndo(state) {
+  const s = state.studySchedule; if (!s || !s.past.length) return state;
+  return { ...state, studySchedule: { past: s.past.slice(0, -1), current: s.past[s.past.length - 1], future: [ s.current, ...s.future ] } };
+}
+function studyRedo(state) {
+  const s = state.studySchedule; if (!s || !s.future.length) return state;
+  return { ...state, studySchedule: { past: [ ...s.past, s.current ], current: s.future[0], future: s.future.slice(1) } };
+}
+// 現在の目標上限(最新セグメント)
+function curStudyCaps(segs) { const seg = segs[segs.length - 1]; return { weekday: seg.weekday, weekend: seg.weekend }; }
 function logsEff(f,logs) {
   let t=0; Object.values(logs).forEach(arr=>{
     if(!Array.isArray(arr))return;
@@ -72,25 +125,25 @@ function fieldComplete(f) {
 }
 
 // ═══ Date-aware allocation analysis (Study) ═══
-function getAllocOnDate(fields, date) {
+function getAllocOnDate(fields, date, segs) {
   let total = 0;
   fields.forEach(f => {
     if (date < f.startDate || !f.pct) return;
-    const end = fieldEnd(f);
+    const end = fieldEnd(f, segs);
     if (end && date > end) return;
     total += f.pct;
   });
   return total;
 }
 
-function findOverAllocDays(fields) {
+function findOverAllocDays(fields, segs) {
   let maxEnd = GS;
-  fields.forEach(f => { const e = fieldEnd(f); if (e && e > maxEnd) maxEnd = e; });
+  fields.forEach(f => { const e = fieldEnd(f, segs); if (e && e > maxEnd) maxEnd = e; });
   const scanEnd = addD(maxEnd, 30);
   const issues = [];
   let d = GS;
   while (d <= scanEnd) {
-    const alloc = getAllocOnDate(fields, d);
+    const alloc = getAllocOnDate(fields, d, segs);
     if (alloc > 100) issues.push({ date: d, pct: alloc });
     d = addD(d, 1);
     if (issues.length > 500) break;
@@ -98,15 +151,15 @@ function findOverAllocDays(fields) {
   return issues;
 }
 
-function findUnderAllocDays(fields) {
+function findUnderAllocDays(fields, segs) {
   let maxEnd = GS;
-  fields.forEach(f => { const e = fieldEnd(f); if (e && e > maxEnd) maxEnd = e; });
+  fields.forEach(f => { const e = fieldEnd(f, segs); if (e && e > maxEnd) maxEnd = e; });
   const scanEnd = addD(maxEnd, 7);
   const issues = [];
   let d = GS;
   while (d <= scanEnd) {
-    const alloc = getAllocOnDate(fields, d);
-    if (alloc > 0 && alloc < 100 && dailyReq(d) > 0) issues.push({ date: d, pct: alloc });
+    const alloc = getAllocOnDate(fields, d, segs);
+    if (alloc > 0 && alloc < 100 && dailyReq(d, segs) > 0) issues.push({ date: d, pct: alloc });
     d = addD(d, 1);
     if (issues.length > 500) break;
   }
@@ -135,35 +188,88 @@ function summarizeRanges(days) {
 // Phase 2 (Week 3-8): 週1分ずつ延長, w8で11分/回 (上限15分)
 // Phase 3 (Week 9-16): 15分/回スタート、週1分ずつ延長、w14で20分(以降cap)
 // Phase 4 (Week 17~): 20分/回スタート、週1分ずつ延長、w27で30分(以降cap)
-function medWeek(date, startDate) {
-  if (!startDate) return 0;
-  const day = diffD(startDate, date) + 1;
+//
+// 瞑想もスケジュール(セグメント列)で管理。各セグメントは {from, vStart}。
+// vStart は「仮想開始日」で、effectiveWeek = ceil((diffD(vStart,date)+1)/7)。
+// 目標(分)を変更すると、その分に対応するプログラム週へ vStart をずらす
+// (＝フェーズと実践法も連動してずれる)。過去は古いセグメントで凍結。
+function medGenesisSched(startDate) {
+  const s = startDate || MED_START_DEFAULT;
+  return { past: [], current: [ { from: s, vStart: s } ], future: [] };
+}
+function getMedSegs(state) {
+  const c = state && state.medSchedule && Array.isArray(state.medSchedule.current) && state.medSchedule.current.length
+    ? state.medSchedule.current : null;
+  if (c) return c;
+  const s = (state && state.meditation && state.meditation.startDate) || MED_START_DEFAULT;
+  return [ { from: s, vStart: s } ];
+}
+function medActiveVStart(medSegs, date) {
+  for (let i = medSegs.length - 1; i >= 0; i--) { if (medSegs[i].from <= date) return medSegs[i].vStart; }
+  return medSegs[0] ? medSegs[0].vStart : null;
+}
+function medWeek(date, medSegs) {
+  const vs = medActiveVStart(medSegs, date);
+  if (!vs) return 0;
+  const day = diffD(vs, date) + 1;
   return day <= 0 ? 0 : Math.ceil(day / 7);
 }
-function medPhase(date, startDate) {
-  const w = medWeek(date, startDate);
-  if (w <= 0) return 0;
-  if (w <= 2) return 1;
-  if (w <= 8) return 2;
-  if (w <= 16) return 3;
-  return 4;
-}
-function medPerSessionPlan(date, startDate) {
-  const w = medWeek(date, startDate);
+// 週番号→1回あたりの分(プログラム定義)
+function medPerSessionByWeek(w) {
   if (w <= 0) return 0;
   if (w <= 2) return 5;
   if (w <= 8) return Math.min(5 + (w - 2), 15);
   if (w <= 16) return Math.min(15 + (w - 9), 20);
   return Math.min(20 + (w - 17), 30);
 }
-function medDailyPlan(date, startDate) {
-  return medPerSessionPlan(date, startDate) * 1;
+function medPhaseByWeek(w) {
+  if (w <= 0) return 0;
+  if (w <= 2) return 1;
+  if (w <= 8) return 2;
+  if (w <= 16) return 3;
+  return 4;
 }
-function medDefaultPractice(date, startDate) {
-  const p = medPhase(date, startDate);
+function medPhase(date, medSegs) { return medPhaseByWeek(medWeek(date, medSegs)); }
+function medPerSessionPlan(date, medSegs) { return medPerSessionByWeek(medWeek(date, medSegs)); }
+function medDailyPlan(date, medSegs) { return medPerSessionPlan(date, medSegs) * 1; }
+function medDefaultPracticeByWeek(w) {
+  const p = medPhaseByWeek(w);
   if (p === 3) return "隨息観";
   if (p === 4) return "只管打坐";
   return "数息観";
+}
+function medDefaultPractice(date, medSegs) { return medDefaultPracticeByWeek(medWeek(date, medSegs)); }
+// 目標分→最も近いプログラム週(タイは小さい週)。値はギャップ(12-14分)を含むため近傍にスナップ。
+function medInvPerSession(M) {
+  let best = 1, bestDiff = Infinity;
+  for (let w = 1; w <= 400; w++) {
+    const v = medPerSessionByWeek(w);
+    const diff = Math.abs(v - M);
+    if (diff < bestDiff) { bestDiff = diff; best = w; }
+    if (v >= 30 && M >= 30) { best = w; break; }
+  }
+  return best;
+}
+// 瞑想目標を適用(今日から、フェーズずらし)。
+function applyMedTarget(state, minutes) {
+  const sched = state.medSchedule && Array.isArray(state.medSchedule.current) && state.medSchedule.current.length
+    ? state.medSchedule : medGenesisSched(state.meditation && state.meditation.startDate);
+  const segs = sched.current;
+  const C = today();
+  const w = medInvPerSession(minutes);
+  const vStart = addD(C, -7 * (w - 1));
+  const newSeg = { from: C, vStart };
+  const last = segs[segs.length - 1];
+  const newCurrent = (last && last.from === C) ? [ ...segs.slice(0, -1), newSeg ] : [ ...segs, newSeg ];
+  return { ...state, medSchedule: { past: [ ...sched.past, segs ], current: newCurrent, future: [] } };
+}
+function medUndo(state) {
+  const s = state.medSchedule; if (!s || !s.past.length) return state;
+  return { ...state, medSchedule: { past: s.past.slice(0, -1), current: s.past[s.past.length - 1], future: [ s.current, ...s.future ] } };
+}
+function medRedo(state) {
+  const s = state.medSchedule; if (!s || !s.future.length) return state;
+  return { ...state, medSchedule: { past: [ ...s.past, s.current ], current: s.future[0], future: s.future.slice(1) } };
 }
 function medCheckMissTwice(meditation) {
   if (!meditation || !meditation.startDate) return null;
@@ -202,6 +308,20 @@ function migrateMed(state){
   } else {
     if(!state.meditation.startDate) state.meditation.startDate = MED_START_DEFAULT;
     if(!state.meditation.sessions || typeof state.meditation.sessions !== "object") state.meditation.sessions = {};
+  }
+  // 勉強スケジュール(目標履歴)。なければ genesis(現行挙動を完全再現)で初期化。
+  if(!state.studySchedule || !Array.isArray(state.studySchedule.current) || !state.studySchedule.current.length){
+    state.studySchedule = genesisStudySched();
+  } else {
+    if(!Array.isArray(state.studySchedule.past)) state.studySchedule.past = [];
+    if(!Array.isArray(state.studySchedule.future)) state.studySchedule.future = [];
+  }
+  // 瞑想スケジュール(目標履歴)。なければ genesis(startDate基準)で初期化。
+  if(!state.medSchedule || !Array.isArray(state.medSchedule.current) || !state.medSchedule.current.length){
+    state.medSchedule = medGenesisSched(state.meditation.startDate);
+  } else {
+    if(!Array.isArray(state.medSchedule.past)) state.medSchedule.past = [];
+    if(!Array.isArray(state.medSchedule.future)) state.medSchedule.future = [];
   }
   return state;
 }
@@ -263,7 +383,7 @@ async function load(){
 }
 function save(d){saveLocal(d);}
 
-const DEF={fields:[],logs:{},meditation:{startDate:MED_START_DEFAULT,sessions:{}}};
+const DEF={fields:[],logs:{},meditation:{startDate:MED_START_DEFAULT,sessions:{}},studySchedule:genesisStudySched(),medSchedule:medGenesisSched(MED_START_DEFAULT)};
 
 // ═══ Styles ═══
 const card={background:"linear-gradient(135deg,#0f1419,#1a1f2e)",borderRadius:16,padding:"18px 22px",border:"1px solid rgba(255,255,255,0.06)",marginBottom:16};
@@ -411,22 +531,23 @@ function DailyCompareChart({ data: rawData, w=540, h=220, successColor="#4ade80"
 }
 
 // ═══ Build chart data helpers ═══
-function buildDailyCompare(state, ff, halfWeeks) {
+function buildDailyCompare(state, ff, halfWeeks, offsetDays=0) {
   const { fields, logs } = state;
+  const segs=getSegs(state);
   const t=today(); const halfDays=halfWeeks*7;
-  const startD=addD(t,-halfDays), endD=addD(t,halfDays);
+  const startD=addD(t,-halfDays+offsetDays), endD=addD(t,halfDays+offsetDays);
   const totalDays=diffD(startD,endD)+1;
   if (totalDays <= 0) return [];
   const af=ff?fields.filter(f=>f.id===ff):fields;
   const endMap=new Map();
-  af.forEach(f=>{endMap.set(f.id, fieldEnd(f));});
+  af.forEach(f=>{endMap.set(f.id, fieldEnd(f,segs));});
   const out=[];
   for(let i=0;i<totalDays;i++){
     const d=addD(startD,i);
     let dp=0;
     af.forEach(f=>{
       const end=endMap.get(f.id);
-      if(d>=f.startDate && f.pct && (!end||d<=end)) dp+=fieldReq(f,d);
+      if(d>=f.startDate && f.pct && (!end||d<=end)) dp+=fieldReq(f,d,segs);
     });
     dp=Math.round(dp*10)/10;
     let da=0;
@@ -438,14 +559,15 @@ function buildDailyCompare(state, ff, halfWeeks) {
   return out;
 }
 
-function buildPlanActualChart(state, halfWeeks) {
+function buildPlanActualChart(state, halfWeeks, offsetDays=0) {
   const { fields, logs } = state;
+  const segs=getSegs(state);
   const t=today(); const halfDays=halfWeeks*7;
-  const startD=addD(t,-halfDays), endD=addD(t,halfDays);
+  const startD=addD(t,-halfDays+offsetDays), endD=addD(t,halfDays+offsetDays);
   const totalDays=diffD(startD,endD)+1;
   if (totalDays <= 0) return [];
   const endMap=new Map();
-  fields.forEach(f=>{endMap.set(f.id, fieldEnd(f));});
+  fields.forEach(f=>{endMap.set(f.id, fieldEnd(f,segs));});
   const out=[];
   for(let i=0;i<totalDays;i++){
     const d=addD(startD,i);
@@ -457,7 +579,7 @@ function buildPlanActualChart(state, halfWeeks) {
       fields.forEach((f,fi)=>{
         const end=endMap.get(f.id);
         let val=0;
-        if(d>=f.startDate && f.pct && (!end||d<=end)) val=fieldReq(f,d);
+        if(d>=f.startDate && f.pct && (!end||d<=end)) val=fieldReq(f,d,segs);
         segments.push({fid:f.id,val,color:CL[fi%CL.length],dashed:true});
       });
     } else {
@@ -471,25 +593,26 @@ function buildPlanActualChart(state, halfWeeks) {
         segments.push({fid:f.id,val,color:CL[fi%CL.length],dashed:false});
       });
     }
-    const cap=dailyReq(d);
+    const cap=dailyReq(d,segs);
     out.push({d,lbl:fS(d),cap,segments,total:segments.reduce((s,x)=>s+x.val,0)});
   }
   return out;
 }
 
-function buildMedDailyCompare(state, halfWeeks) {
+function buildMedDailyCompare(state, halfWeeks, offsetDays=0) {
   const med = state.meditation;
   if (!med || !med.startDate) return [];
+  const medSegs = getMedSegs(state);
   const t = today();
   const halfDays = halfWeeks * 7;
-  const startD = addD(t, -halfDays);
-  const endD = addD(t, halfDays);
+  const startD = addD(t, -halfDays+offsetDays);
+  const endD = addD(t, halfDays+offsetDays);
   const totalDays = diffD(startD, endD) + 1;
   if (totalDays <= 0) return [];
   const out = [];
   for (let i = 0; i < totalDays; i++) {
     const d = addD(startD, i);
-    const plan = (d >= med.startDate) ? medDailyPlan(d, med.startDate) : 0;
+    const plan = (d >= med.startDate) ? medDailyPlan(d, medSegs) : 0;
     const sess = Array.isArray(med.sessions[d]) ? med.sessions[d] : [];
     const actual = sess.reduce((s, x) => s + (x.duration || 0), 0);
     const hasData = d <= t || sess.length > 0;
@@ -500,6 +623,7 @@ function buildMedDailyCompare(state, halfWeeks) {
 
 function calcCum(state, ff) {
   const {fields,logs}=state; const t=today();
+  const segs=getSegs(state);
   const af=ff?fields.filter(f=>f.id===ff):fields;
   let cumA=0;
   // 各分野の計画累計は fieldEff(=総実質p) で頭打ちにする。
@@ -518,7 +642,7 @@ function calcCum(state, ff) {
       if(d<f.startDate) return;
       const te=teMap.get(f.id); const cur=cumPF.get(f.id);
       if(cur>=te) return;
-      cumPF.set(f.id, Math.min(cur+fieldReq(f,d), te));
+      cumPF.set(f.id, Math.min(cur+fieldReq(f,d,segs), te));
     });
     let da=0; const ents=Array.isArray(logs[d])?logs[d]:[];
     ents.forEach(e=>{const f=fields.find(x=>x.id===e.fid);if(!f||(ff&&f.id!==ff))return;const b=f.books.find(x=>x.id===e.bid);if(b)da+=e.pg*(b.coeff||1);});
@@ -526,7 +650,7 @@ function calcCum(state, ff) {
   }
   let cumP=0; cumPF.forEach(v=>cumP+=v);
   const pageDiff=cumA-cumP;
-  const todayReq=af.reduce((s,f)=>s+(fieldComplete(f)?0:fieldReq(f,t)),0);
+  const todayReq=af.reduce((s,f)=>s+(fieldComplete(f)?0:fieldReq(f,t,segs)),0);
   const daysDiff=todayReq>0?pageDiff/todayReq:0;
   return {pageDiff:Math.round(pageDiff*10)/10,daysDiff:Math.round(daysDiff*10)/10,cumPlan:Math.round(cumP),cumActual:Math.round(cumA)};
 }
@@ -687,11 +811,88 @@ function MedProcedureModal({onClose}) {
   );
 }
 
+// ═══ Confirm dialog (dark) ═══
+function ConfirmModal({title, lines, accent="#fbbf24", onYes, onNo, yesLabel="はい", noLabel="いいえ"}) {
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.72)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1200,padding:16}} onClick={onNo}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#161b26",borderRadius:18,padding:"22px 22px 18px",maxWidth:420,width:"100%",border:`1px solid ${accent}33`}}>
+        <div style={{color:"#fff",fontSize:16,fontWeight:700,marginBottom:12}}>{title}</div>
+        <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,lineHeight:1.85,marginBottom:18}}>
+          {lines.map((l,i)=>(<div key={i}>{l}</div>))}
+        </div>
+        <div style={{display:"flex",gap:10}}>
+          <button onClick={onNo} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.55)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13,fontWeight:600}}>{noLabel}</button>
+          <button onClick={onYes} style={{flex:1,background:accent,color:"#0a0e14",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13,fontWeight:700}}>{yesLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══ Undo/Redo control row ═══
+function HistoryControls({canUndo, canRedo, onUndo, onRedo, accent="#fbbf24", undoCount=0, redoCount=0}) {
+  return (
+    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+      <button onClick={onUndo} disabled={!canUndo} style={{
+        flex:1,background:canUndo?"rgba(255,255,255,0.06)":"rgba(255,255,255,0.02)",
+        color:canUndo?"rgba(255,255,255,0.65)":"rgba(255,255,255,0.18)",
+        border:`1px solid ${canUndo?"rgba(255,255,255,0.12)":"rgba(255,255,255,0.05)"}`,
+        borderRadius:9,padding:"9px 8px",fontSize:12,fontWeight:600,cursor:canUndo?"pointer":"default"
+      }}>↶ 戻す{undoCount>0?` (${undoCount})`:""}</button>
+      <button onClick={onRedo} disabled={!canRedo} style={{
+        flex:1,background:canRedo?"rgba(255,255,255,0.06)":"rgba(255,255,255,0.02)",
+        color:canRedo?"rgba(255,255,255,0.65)":"rgba(255,255,255,0.18)",
+        border:`1px solid ${canRedo?"rgba(255,255,255,0.12)":"rgba(255,255,255,0.05)"}`,
+        borderRadius:9,padding:"9px 8px",fontSize:12,fontWeight:600,cursor:canRedo?"pointer":"default"
+      }}>進む ↷{redoCount>0?` (${redoCount})`:""}</button>
+    </div>
+  );
+}
+
 // ═══ Tab 1: Plan ═══
 function PlanTab({state,persist}) {
   const [ed,setEd]=useState(null);
   const [bt,setBt]=useState("");const [bp,setBp]=useState("");const [bc,setBc]=useState("1.0");
   const [showProc,setShowProc]=useState(false);
+
+  const segs=useMemo(()=>getSegs(state),[state]);
+  const medSegs=useMemo(()=>getMedSegs(state),[state]);
+
+  // 目標設定 (study)
+  const caps=useMemo(()=>curStudyCaps(segs),[segs]);
+  const [wkInp,setWkInp]=useState(String(Math.round(caps.weekday)));
+  const [weInp,setWeInp]=useState(String(Math.round(caps.weekend)));
+  const [confirmStudy,setConfirmStudy]=useState(null);
+  useEffect(()=>{ setWkInp(String(Math.round(caps.weekday))); setWeInp(String(Math.round(caps.weekend))); },[caps.weekday,caps.weekend]);
+
+  // 目標設定 (meditation)
+  const [medInp,setMedInp]=useState("");
+  const [confirmMed,setConfirmMed]=useState(null);
+
+  const studyHist=state.studySchedule||{past:[],current:segs,future:[]};
+  const medHist=state.medSchedule||{past:[],current:medSegs,future:[]};
+
+  function requestStudyApply(){
+    const W=parseFloat(wkInp), E=parseFloat(weInp);
+    if(!(W>0)||!(E>0))return;
+    setConfirmStudy({W,E});
+  }
+  function doStudyApply(){
+    const {W,E}=confirmStudy;
+    persist(applyStudyTarget(state, W, E));
+    setConfirmStudy(null);
+  }
+  function requestMedApply(){
+    const M=parseFloat(medInp);
+    if(!(M>0))return;
+    const w=medInvPerSession(M);
+    const snapped=medPerSessionByWeek(w);
+    setConfirmMed({M,w,snapped,phase:medPhaseByWeek(w),practice:medDefaultPracticeByWeek(w)});
+  }
+  function doMedApply(){
+    persist(applyMedTarget(state, confirmMed.M));
+    setConfirmMed(null);setMedInp("");
+  }
 
   function openNew(){setBt("");setBp("");setBc("1.0");setEd({id:gid(),name:"",cat:"other",pct:"",startDate:GS,books:[]});}
   function openEdit(f){setBt("");setBp("");setBc("1.0");setEd(JSON.parse(JSON.stringify(f)));}
@@ -711,8 +912,8 @@ function PlanTab({state,persist}) {
     setEd(null);
   }
 
-  const overDays = useMemo(()=>findOverAllocDays(state.fields),[state.fields]);
-  const underDays = useMemo(()=>findUnderAllocDays(state.fields),[state.fields]);
+  const overDays = useMemo(()=>findOverAllocDays(state.fields,segs),[state.fields,segs]);
+  const underDays = useMemo(()=>findUnderAllocDays(state.fields,segs),[state.fields,segs]);
   const underSoon = useMemo(()=>{
     const t=today(); const weekEnd=addD(t,7);
     return underDays.filter(d=>d.date>=t && d.date<=weekEnd);
@@ -724,39 +925,66 @@ function PlanTab({state,persist}) {
   const overRanges = useMemo(()=>summarizeRanges(overDays),[overDays]);
   const underSoonRanges = useMemo(()=>summarizeRanges(underSoon),[underSoon]);
   const underLaterRanges = useMemo(()=>summarizeRanges(underLater),[underLater]);
-  const todayAlloc = useMemo(()=>getAllocOnDate(state.fields, today()),[state.fields]);
+  const todayAlloc = useMemo(()=>getAllocOnDate(state.fields, today(), segs),[state.fields,segs]);
+
+  // 完了分野を末尾に、色は元のindex基準で保持
+  const orderedFields = useMemo(()=>{
+    return state.fields.map((f,i)=>({f,i,done:fieldComplete(f)}))
+      .sort((a,b)=>(a.done?1:0)-(b.done?1:0));
+  },[state.fields]);
 
   const previewEnd = useMemo(()=>{
     if(!ed||ed.books.length===0||!ed.pct)return null;
     const pn=parseFloat(ed.pct);if(!pn||pn<=0)return null;
-    return fieldEnd({...ed,pct:pn});
-  },[ed]);
+    return fieldEnd({...ed,pct:pn},segs);
+  },[ed,segs]);
   const previewEff=ed?ed.books.reduce((s,b)=>s+bookEff(b),0):0;
 
   // Meditation plan summary
   const med=state.meditation||{startDate:MED_START_DEFAULT,sessions:{}};
   const t=today();
-  const medPh=medPhase(t,med.startDate);
-  const medWk=medWeek(t,med.startDate);
-  const perSession=medPerSessionPlan(t,med.startDate);
-  const dailyTarget=medDailyPlan(t,med.startDate);
-  const defPractice=medDefaultPractice(t,med.startDate);
+  const medPh=medPhase(t,medSegs);
+  const medWk=medWeek(t,medSegs);
+  const perSession=medPerSessionPlan(t,medSegs);
+  const dailyTarget=medDailyPlan(t,medSegs);
+  const defPractice=medDefaultPractice(t,medSegs);
 
   return (
     <div>
       <div style={card}>
         <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600,marginBottom:8}}>📋 基本設定</div>
         <div style={{color:"rgba(255,255,255,0.35)",fontSize:12,lineHeight:1.8}}>
-          開始: <span style={{color:"#fbbf24"}}>{fF(GS)}(月)</span>　初日1p→20週で定着（平日50p/休日75p）<br/>
+          開始: <span style={{color:"#fbbf24"}}>{fF(GS)}(月)</span>　初日1p→20週で定着<br/>
           毎日+{INCR.toFixed(3)}p（休日×1.5）　バッファなし<br/>
           <span style={{color:"rgba(255,255,255,0.2)"}}>※ 1実質page≈4分。実page×係数＝実質page。</span>
         </div>
       </div>
 
+      {/* ═══ 目標設定 (平日/休日) ═══ */}
+      <div style={card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <span style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600}}>🎯 目標値の設定</span>
+          <span style={{color:"rgba(255,255,255,0.3)",fontSize:10}}>変更は今日から適用</span>
+        </div>
+        <div style={{color:"rgba(255,255,255,0.35)",fontSize:11,marginBottom:10,lineHeight:1.7}}>
+          現在の上限：平日 <span style={{color:"#fbbf24",fontWeight:600}}>{Math.round(caps.weekday)}p</span> / 休日 <span style={{color:"#fbbf24",fontWeight:600}}>{Math.round(caps.weekend)}p</span><br/>
+          引き上げ時は毎日+{INCR.toFixed(3)}pずつ(休日×1.5)で目標まで上昇。引き下げ時は即日反映。
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:10}}>
+          <div style={{flex:1}}><label style={lb}>平日 目標(p/日)</label><input type="number" value={wkInp} onChange={e=>setWkInp(e.target.value)} style={{...inp,fontSize:15,fontWeight:700}}/></div>
+          <div style={{flex:1}}><label style={lb}>休日 目標(p/日)</label><input type="number" value={weInp} onChange={e=>setWeInp(e.target.value)} style={{...inp,fontSize:15,fontWeight:700}}/></div>
+        </div>
+        <button onClick={requestStudyApply} style={{width:"100%",background:"rgba(251,191,36,0.14)",color:"#fbbf24",border:"1px solid rgba(251,191,36,0.3)",borderRadius:10,padding:"11px",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:8}}>この目標を適用</button>
+        <HistoryControls
+          canUndo={!!(studyHist.past&&studyHist.past.length)} canRedo={!!(studyHist.future&&studyHist.future.length)}
+          undoCount={(studyHist.past||[]).length} redoCount={(studyHist.future||[]).length}
+          onUndo={()=>persist(studyUndo(state))} onRedo={()=>persist(studyRedo(state))} accent="#fbbf24"/>
+      </div>
+
       <div style={card}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>今日 {fF(today())}({dw(today())}) のノルマ</span>
-          <span style={{color:"#fbbf24",fontSize:20,fontWeight:700}}>{dailyReq(today()).toFixed(1)}<span style={{fontSize:12,fontWeight:400}}> 実質p</span></span>
+          <span style={{color:"#fbbf24",fontSize:20,fontWeight:700}}>{dailyReq(today(),segs).toFixed(1)}<span style={{fontSize:12,fontWeight:400}}> 実質p</span></span>
         </div>
         <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:4,textAlign:"right"}}>
           今日の割当: <span style={{color:todayAlloc===100?"#4ade80":todayAlloc>100?"#f87171":"#fbbf24",fontWeight:600}}>{todayAlloc}%</span>
@@ -805,17 +1033,19 @@ function PlanTab({state,persist}) {
 
       <div style={card}>
         <div style={{color:"rgba(255,255,255,0.6)",fontSize:13,fontWeight:600,marginBottom:8}}>分野一覧</div>
-        {state.fields.map((f,i)=>{
-          const te=fieldEff(f);const end=fieldEnd(f);const ae=logsEff(f,state.logs);
+        {orderedFields.map(({f,i,done})=>{
+          const col=CL[i%CL.length];
+          const te=fieldEff(f);const end=fieldEnd(f,segs);const ae=logsEff(f,state.logs);
           const pct=te>0?Math.min(ae/te*100,100):0;
           return (
-            <div key={f.id} style={{background:"rgba(255,255,255,0.03)",borderRadius:12,padding:"12px 16px",marginBottom:8,border:`1px solid ${CL[i%CL.length]}22`}}>
+            <div key={f.id} style={{background:done?"rgba(255,255,255,0.015)":"rgba(255,255,255,0.03)",borderRadius:12,padding:"12px 16px",marginBottom:8,border:`1px solid ${col}${done?"14":"22"}`,opacity:done?0.5:1}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
                 <div style={{flex:1}}>
                   <div style={{display:"flex",alignItems:"center",gap:8}}>
-                    <div style={{width:8,height:8,borderRadius:"50%",background:CL[i%CL.length]}}/>
+                    <div style={{width:8,height:8,borderRadius:"50%",background:col}}/>
                     <span style={{color:"#fff",fontWeight:600,fontSize:14}}>{f.name}</span>
-                    <span style={{color:CL[i%CL.length],fontSize:12,fontWeight:700}}>{f.pct}%</span>
+                    <span style={{color:col,fontSize:12,fontWeight:700}}>{f.pct}%</span>
+                    {done&&<span style={{color:"#4ade80",fontSize:10,fontWeight:600,marginLeft:2}}>✓ 完了</span>}
                   </div>
                   <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:3,marginLeft:16}}>
                     {fF(f.startDate)}〜{end?fF(end):""} · {f.books.length}冊 · 実質{te.toFixed(0)}p
@@ -827,16 +1057,19 @@ function PlanTab({state,persist}) {
                 </div>
               </div>
               <div style={{marginTop:6,marginLeft:16}}>
-                {f.books.map(b=>(
-                  <div key={b.id} style={{display:"flex",justifyContent:"space-between",padding:"2px 0",opacity:b.disabled?0.5:1}}>
+                {f.books.map(b=>{
+                  const pr=Math.min(b.pagesRead||0,b.totalPages);
+                  return (
+                  <div key={b.id} style={{display:"flex",justifyContent:"space-between",padding:"2px 0",opacity:b.disabled?0.6:1}}>
                     <span style={{color:"rgba(255,255,255,0.55)",fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1,textDecoration:b.disabled?"line-through":"none"}}>{b.title}</span>
-                    <span style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginLeft:8,whiteSpace:"nowrap"}}>{b.disabled?`無効 · 読了${b.pagesRead||0}p`:`${b.totalPages}p×${b.coeff}=${bookEff(b).toFixed(0)}実質p`}</span>
+                    <span style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginLeft:8,whiteSpace:"nowrap"}}>{b.disabled?`無効 · 既読${pr}p`:`${pr}/${b.totalPages}p ×${b.coeff} = ${bookEff(b).toFixed(0)}実質p`}</span>
                   </div>
-                ))}
+                  );
+                })}
               </div>
               <div style={{display:"flex",alignItems:"center",gap:8,marginTop:6}}>
                 <div style={{flex:1,background:"rgba(255,255,255,0.06)",borderRadius:4,height:4,overflow:"hidden"}}>
-                  <div style={{width:`${pct}%`,height:"100%",background:CL[i%CL.length],borderRadius:4}}/>
+                  <div style={{width:`${pct}%`,height:"100%",background:col,borderRadius:4}}/>
                 </div>
                 <span style={{color:"rgba(255,255,255,0.4)",fontSize:11}}>{pct.toFixed(0)}%</span>
               </div>
@@ -873,8 +1106,52 @@ function PlanTab({state,persist}) {
           )}
         </div>
 
+        {/* 瞑想 目標設定 */}
+        <div style={{...card,borderColor:`${MED_COLOR}22`}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <span style={{color:MED_COLOR,fontSize:12,fontWeight:600}}>🎯 1日の目標を設定</span>
+            <span style={{color:"rgba(255,255,255,0.3)",fontSize:10}}>変更は今日から適用</span>
+          </div>
+          <div style={{color:"rgba(255,255,255,0.35)",fontSize:11,marginBottom:10,lineHeight:1.7}}>
+            設定した分に最も近いプログラム週へ移動し、フェーズ・実践法も連動してずれます。以降は週+1分で進行。
+          </div>
+          <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"flex-end"}}>
+            <div style={{flex:1}}><label style={lb}>目標(分/日)</label><input type="number" value={medInp} onChange={e=>setMedInp(e.target.value)} placeholder={`現在: ${dailyTarget}`} style={{...inp,fontSize:15,fontWeight:700}}/></div>
+            <button onClick={requestMedApply} style={{flex:1,background:`${MED_COLOR}22`,color:MED_COLOR,border:`1px solid ${MED_COLOR}44`,borderRadius:10,padding:"11px",fontSize:13,fontWeight:700,cursor:"pointer"}}>適用</button>
+          </div>
+          <HistoryControls
+            canUndo={!!(medHist.past&&medHist.past.length)} canRedo={!!(medHist.future&&medHist.future.length)}
+            undoCount={(medHist.past||[]).length} redoCount={(medHist.future||[]).length}
+            onUndo={()=>persist(medUndo(state))} onRedo={()=>persist(medRedo(state))} accent={MED_COLOR}/>
+        </div>
+
         <button onClick={()=>setShowProc(true)} style={{width:"100%",background:`${MED_COLOR}1a`,color:MED_COLOR,border:`1px solid ${MED_COLOR}44`,borderRadius:12,padding:"14px",fontSize:13,fontWeight:600,cursor:"pointer",letterSpacing:"0.05em"}}>📖 瞑想の手順を表示（タップで展開）</button>
       </div>
+
+      {confirmStudy && (
+        <ConfirmModal
+          title="目標値を変更しますか？"
+          accent="#fbbf24"
+          lines={[
+            `平日: ${Math.round(caps.weekday)}p → ${confirmStudy.W}p`,
+            `休日: ${Math.round(caps.weekend)}p → ${confirmStudy.E}p`,
+            "今日以降の計画・各分野の完了予定日が変わります。",
+            "昨日までの計画は変更されません。"
+          ]}
+          onYes={doStudyApply} onNo={()=>setConfirmStudy(null)}/>
+      )}
+      {confirmMed && (
+        <ConfirmModal
+          title="瞑想の目標を変更しますか？"
+          accent={MED_COLOR}
+          lines={[
+            `入力: ${confirmMed.M}分/日`,
+            `→ ${confirmMed.snapped}分/日 (Week ${confirmMed.w}相当・Phase ${confirmMed.phase}・${confirmMed.practice})`,
+            "今日以降の計画とフェーズが変わります。",
+            "昨日までの計画は変更されません。"
+          ]}
+          onYes={doMedApply} onNo={()=>setConfirmMed(null)}/>
+      )}
 
       {ed&&(
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
@@ -939,21 +1216,50 @@ function PlanTab({state,persist}) {
 function ChartTab({state}) {
   const [ff,setFf]=useState(null);
   const [hw,setHw]=useState(4);
+  const [offsetDays,setOffsetDays]=useState(0);
 
-  const compareData=useMemo(()=>buildDailyCompare(state,ff,hw),[state,ff,hw]);
-  const paData=useMemo(()=>buildPlanActualChart(state,hw),[state,hw]);
+  const segs=useMemo(()=>getSegs(state),[state]);
+  const medSegs=useMemo(()=>getMedSegs(state),[state]);
+
+  const compareData=useMemo(()=>buildDailyCompare(state,ff,hw,offsetDays),[state,ff,hw,offsetDays]);
+  const paData=useMemo(()=>buildPlanActualChart(state,hw,offsetDays),[state,hw,offsetDays]);
   const cum=useMemo(()=>calcCum(state,ff),[state,ff]);
-  const medCompareData=useMemo(()=>buildMedDailyCompare(state,hw),[state,hw]);
+  const medCompareData=useMemo(()=>buildMedDailyCompare(state,hw,offsetDays),[state,hw,offsetDays]);
   const sur=cum.pageDiff>=0;
   const tw=hw*2;
 
+  // 横スクロール(パン): ドラッグ + 矢印ボタン。3グラフ連動。
+  const visibleDays=hw*14+1;
+  const drag=useRef({active:false,startX:0,startOffset:0,width:1});
+  const onPanDown=useCallback((e)=>{
+    const w=e.currentTarget.clientWidth||1;
+    drag.current={active:true,startX:e.clientX,startOffset:offsetDays,width:w};
+    try{e.currentTarget.setPointerCapture(e.pointerId);}catch{}
+  },[offsetDays]);
+  const onPanMove=useCallback((e)=>{
+    if(!drag.current.active)return;
+    const dx=e.clientX-drag.current.startX;
+    const days=Math.round(-dx/drag.current.width*visibleDays);
+    setOffsetDays(drag.current.startOffset+days);
+  },[visibleDays]);
+  const onPanUp=useCallback((e)=>{
+    drag.current.active=false;
+    try{e.currentTarget.releasePointerCapture(e.pointerId);}catch{}
+  },[]);
+  const panProps={
+    onPointerDown:onPanDown,onPointerMove:onPanMove,onPointerUp:onPanUp,onPointerCancel:onPanUp,
+    style:{touchAction:"pan-y",cursor:"grab"}
+  };
+  const panStep=Math.max(1,Math.round(hw*7/2));
+  const stepOffset=(dir)=>setOffsetDays(o=>o+dir*panStep);
+
   const t=today();
   const med=state.meditation||{};
-  const medPh=medPhase(t,med.startDate);
-  const medWk=medWeek(t,med.startDate);
-  const perSession=medPerSessionPlan(t,med.startDate);
-  const dailyTarget=medDailyPlan(t,med.startDate);
-  const defPractice=medDefaultPractice(t,med.startDate);
+  const medPh=medPhase(t,medSegs);
+  const medWk=medWeek(t,medSegs);
+  const perSession=medPerSessionPlan(t,medSegs);
+  const dailyTarget=medDailyPlan(t,medSegs);
+  const defPractice=medDefaultPractice(t,medSegs);
 
   const fieldLegend=state.fields.map((f,i)=>(
     <div key={f.id} style={{display:"flex",alignItems:"center",gap:3}}>
@@ -1007,6 +1313,14 @@ function ChartTab({state}) {
           <span style={{color:"rgba(255,255,255,0.15)",fontSize:9}}>±1週</span>
           <span style={{color:"rgba(255,255,255,0.15)",fontSize:9}}>±5年</span>
         </div>
+        <div style={{display:"flex",gap:8,alignItems:"center",marginTop:12,paddingTop:10,borderTop:"1px solid rgba(255,255,255,0.05)"}}>
+          <button onClick={()=>stepOffset(-1)} style={{flex:1,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",color:"rgba(255,255,255,0.6)",borderRadius:9,padding:"8px",fontSize:14,cursor:"pointer"}}>◀ 過去</button>
+          <button onClick={()=>setOffsetDays(0)} disabled={offsetDays===0} style={{flex:1,background:offsetDays===0?"rgba(255,255,255,0.03)":"rgba(251,191,36,0.14)",border:`1px solid ${offsetDays===0?"rgba(255,255,255,0.06)":"rgba(251,191,36,0.3)"}`,color:offsetDays===0?"rgba(255,255,255,0.25)":"#fbbf24",borderRadius:9,padding:"8px",fontSize:12,fontWeight:600,cursor:offsetDays===0?"default":"pointer"}}>今日に戻す</button>
+          <button onClick={()=>stepOffset(1)} style={{flex:1,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",color:"rgba(255,255,255,0.6)",borderRadius:9,padding:"8px",fontSize:14,cursor:"pointer"}}>未来 ▶</button>
+        </div>
+        <div style={{textAlign:"center",marginTop:6,color:"rgba(255,255,255,0.25)",fontSize:10}}>
+          グラフを左右にドラッグでも移動できます{offsetDays!==0?` · 中心 ${fS(addD(t,offsetDays))}`:""}
+        </div>
       </div>
 
       <div style={{...card,padding:"14px 6px 6px"}}>
@@ -1027,9 +1341,12 @@ function ChartTab({state}) {
             </div>
           </div>
         </div>
-        <DailyCompareChart data={compareData} />
+        <div {...panProps}>
+          <DailyCompareChart data={compareData} />
+        </div>
       </div>
 
+      <div {...panProps}>
       <StackedChart days={paData} fields={state.fields} showCapLine={true}
         title="実績 + 予定（分野別積み上げ）"
         legend={<>
@@ -1044,14 +1361,15 @@ function ChartTab({state}) {
           </div>
         </>}
       />
+      </div>
 
       <div style={card}>
         <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>分野別</div>
         {state.fields.map((f,i)=>{
           const te=fieldEff(f);const ae=logsEff(f,state.logs);
           let latestD=t;Object.keys(state.logs).forEach(d=>{const arr=state.logs[d];if(Array.isArray(arr)&&arr.some(e=>e.fid===f.id)&&d>latestD)latestD=d;});
-          let pln=0,d=f.startDate;while(d<=latestD&&pln<te){pln=Math.min(pln+fieldReq(f,d),te);d=addD(d,1);}
-          const diff=ae-pln;const dayReq=fieldReq(f,t);const daysDiff=dayReq>0?(diff/dayReq):0;
+          let pln=0,d=f.startDate;while(d<=latestD&&pln<te){pln=Math.min(pln+fieldReq(f,d,segs),te);d=addD(d,1);}
+          const diff=ae-pln;const dayReq=fieldReq(f,t,segs);const daysDiff=dayReq>0?(diff/dayReq):0;
           return (
             <div key={f.id} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
               <div style={{width:6,height:6,borderRadius:"50%",background:CL[i%CL.length],flexShrink:0}}/>
@@ -1117,7 +1435,9 @@ function ChartTab({state}) {
               </div>
             </div>
           </div>
-          <DailyCompareChart data={medCompareData} successColor={MED_COLOR}/>
+          <div {...panProps}>
+            <DailyCompareChart data={medCompareData} successColor={MED_COLOR}/>
+          </div>
           <div style={{padding:"4px 16px 8px",color:"rgba(255,255,255,0.25)",fontSize:10,textAlign:"right"}}>
             単位: 分/日
           </div>
@@ -1136,14 +1456,15 @@ function MeditationSection({state, persist, vd, openProc}) {
   const [celebrate,setCelebrate]=useState(false);
 
   const med=state.meditation||{startDate:MED_START_DEFAULT,sessions:{}};
+  const medSegs=useMemo(()=>getMedSegs(state),[state]);
   const t=today();
   const isToday=vd===t;
   const beforeStart=vd<med.startDate;
-  const phase=medPhase(vd,med.startDate);
-  const week=medWeek(vd,med.startDate);
-  const perSession=medPerSessionPlan(vd,med.startDate);
-  const dailyTarget=medDailyPlan(vd,med.startDate);
-  const defPractice=medDefaultPractice(vd,med.startDate);
+  const phase=medPhase(vd,medSegs);
+  const week=medWeek(vd,medSegs);
+  const perSession=medPerSessionPlan(vd,medSegs);
+  const dailyTarget=medDailyPlan(vd,medSegs);
+  const defPractice=medDefaultPractice(vd,medSegs);
   const sessions=Array.isArray(med.sessions[vd])?med.sessions[vd]:[];
   const totalActual=sessions.reduce((s,x)=>s+(x.duration||0),0);
   const pct=dailyTarget>0?Math.min(totalActual/dailyTarget*100,100):(totalActual>0?100:0);
@@ -1382,17 +1703,21 @@ function DailyTab({state,persist}) {
   const [vd,setVd]=useState(today());
   const [sf,setSf]=useState(null);const [sb,setSb]=useState(null);const [pg,setPg]=useState("");const [ei,setEi]=useState(null);
   const [showProc,setShowProc]=useState(false);
+  const segs=useMemo(()=>getSegs(state),[state]);
   const reset=()=>{setSb(null);setPg("");setEi(null);};
   const go=(d)=>{setVd(d);reset();};
-  const dReq=dailyReq(vd);
+  const dReq=dailyReq(vd,segs);
+  const vdAlloc=useMemo(()=>getAllocOnDate(state.fields, vd, segs),[state.fields,segs,vd]);
   const dl=Array.isArray(state.logs[vd])?state.logs[vd]:[];
   const fs=state.fields.map(f=>{
     const done=fieldComplete(f);
-    const req=done?0:fieldReq(f,vd);
+    const req=done?0:fieldReq(f,vd,segs);
     let act=0;
     dl.forEach(e=>{if(e.fid!==f.id)return;const b=f.books.find(x=>x.id===e.bid);if(b)act+=e.pg*(b.coeff||1);});
     return {f,req,act,done};
   });
+  // 「分野別」は今日(表示日)に読む目標がある分野(req>0)だけ表示
+  const targetFs=fs.filter(x=>x.req>0);
   const tReq=fs.reduce((s,x)=>s+x.req,0);const tAct=fs.reduce((s,x)=>s+x.act,0);
   const pct=tReq>0?Math.min(tAct/tReq*100,100):0;
 
@@ -1447,18 +1772,23 @@ function DailyTab({state,persist}) {
         <div style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginTop:4,textAlign:"right"}}>{tAct.toFixed(1)} / {tReq.toFixed(1)} 実質p</div>
       </div>
 
+      {vdAlloc>100 && (
+        <div style={{...card,borderColor:"rgba(248,113,113,0.35)",background:"linear-gradient(135deg,#1f1419,#1a1f2e)"}}>
+          <div style={{color:"#f87171",fontSize:13,fontWeight:600,marginBottom:4}}>⚠️ 割当が100%を超えています</div>
+          <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.7}}>
+            {fF(vd)}の分野割当合計は <span style={{color:"#f87171",fontWeight:600}}>{vdAlloc}%</span> です。「計画入力」で各分野の割合を見直してください。
+          </div>
+        </div>
+      )}
+
       <div style={{...card,padding:"14px 18px"}}>
-        <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>分野別</div>
-        {fs.map((x,i)=>{
+        <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>分野別（今日読む目標のある分野）</div>
+        {targetFs.length===0 && (
+          <div style={{padding:"6px 0",color:"rgba(255,255,255,0.25)",fontSize:12}}>この日に読む目標のある分野はありません。</div>
+        )}
+        {targetFs.map((x)=>{
+          const i=state.fields.findIndex(ff=>ff.id===x.f.id);
           const p=x.req>0?Math.min(x.act/x.req*100,100):0;
-          if(vd<x.f.startDate) return <div key={x.f.id} style={{padding:"6px 0",opacity:0.4,fontSize:12,color:"rgba(255,255,255,0.4)"}}>{x.f.name}—{fF(x.f.startDate)}から</div>;
-          if(x.done) return (
-            <div key={x.f.id} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 0",borderBottom:"1px solid rgba(255,255,255,0.04)",opacity:0.55}}>
-              <div style={{width:6,height:6,borderRadius:"50%",background:CL[i%CL.length]}}/>
-              <span style={{color:"rgba(255,255,255,0.55)",fontSize:13}}>{x.f.name}</span>
-              <span style={{color:"#4ade80",fontSize:11,fontWeight:600,marginLeft:"auto"}}>✓ 完了</span>
-            </div>
-          );
           const cb=x.f.books.find(b=>!b.disabled&&b.pagesRead<b.totalPages);
           const hint=cb&&x.req>0?(x.req/(cb.coeff||1)):0;
           return (

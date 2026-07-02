@@ -125,25 +125,33 @@ function fieldComplete(f) {
 }
 
 // ═══ Date-aware allocation analysis (Study) ═══
-function getAllocOnDate(fields, date, segs) {
+// endMap(分野id→完了日)を渡すと fieldEnd の再計算を省略できる(日ループでの性能対策)
+function getAllocOnDate(fields, date, segs, endMap) {
   let total = 0;
   fields.forEach(f => {
     if (date < f.startDate || !f.pct) return;
-    const end = fieldEnd(f, segs);
+    const end = endMap ? endMap.get(f.id) : fieldEnd(f, segs);
     if (end && date > end) return;
     total += f.pct;
   });
   return total;
 }
 
+function buildEndMap(fields, segs) {
+  const m = new Map();
+  fields.forEach(f => m.set(f.id, fieldEnd(f, segs)));
+  return m;
+}
+
 function findOverAllocDays(fields, segs) {
+  const endMap = buildEndMap(fields, segs);
   let maxEnd = GS;
-  fields.forEach(f => { const e = fieldEnd(f, segs); if (e && e > maxEnd) maxEnd = e; });
+  endMap.forEach(e => { if (e && e > maxEnd) maxEnd = e; });
   const scanEnd = addD(maxEnd, 30);
   const issues = [];
   let d = GS;
   while (d <= scanEnd) {
-    const alloc = getAllocOnDate(fields, d, segs);
+    const alloc = getAllocOnDate(fields, d, segs, endMap);
     if (alloc > 100) issues.push({ date: d, pct: alloc });
     d = addD(d, 1);
     if (issues.length > 500) break;
@@ -152,13 +160,14 @@ function findOverAllocDays(fields, segs) {
 }
 
 function findUnderAllocDays(fields, segs) {
+  const endMap = buildEndMap(fields, segs);
   let maxEnd = GS;
-  fields.forEach(f => { const e = fieldEnd(f, segs); if (e && e > maxEnd) maxEnd = e; });
+  endMap.forEach(e => { if (e && e > maxEnd) maxEnd = e; });
   const scanEnd = addD(maxEnd, 7);
   const issues = [];
   let d = GS;
   while (d <= scanEnd) {
-    const alloc = getAllocOnDate(fields, d, segs);
+    const alloc = getAllocOnDate(fields, d, segs, endMap);
     if (alloc > 0 && alloc < 100 && dailyReq(d, segs) > 0) issues.push({ date: d, pct: alloc });
     d = addD(d, 1);
     if (issues.length > 500) break;
@@ -295,14 +304,30 @@ function medCheckMissTwice(meditation) {
 
 // ═══ Storage ═══
 const SK="study-v6";
+// ※ v6 GAS (google-apps-script-v6.js) のデプロイが必要（応答形式が変わったため）
 const GAS_URL="https://script.google.com/macros/s/AKfycbxBWoJBEKDTPzAP8lo94OoXdYyS92TlcFu3EG3gmewWxbHE-jeJ8VsnNDqElEISueK9/exec";
 const API_KEY="kano_study_2026_secret";
 
 function loadLocal(){try{const r=localStorage.getItem(SK);return r?JSON.parse(r):null;}catch{return null;}}
 function saveLocal(d){try{localStorage.setItem(SK,JSON.stringify(d));}catch{}}
 
+// データとして意味のある内容(分野 or 瞑想記録)を持つか
+function hasData(d){
+  if(!d)return false;
+  if(Array.isArray(d.fields)&&d.fields.length>0)return true;
+  if(d.meditation&&d.meditation.sessions&&Object.keys(d.meditation.sessions).length>0)return true;
+  return false;
+}
+function fmtTs(ts){
+  if(!ts)return "記録なし";
+  const d=new Date(ts);
+  return `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+}
+
 function migrateMed(state){
   if(!state) return state;
+  if(!Array.isArray(state.fields)) state.fields=[];
+  if(!state.logs||typeof state.logs!=="object"||Array.isArray(state.logs)) state.logs={};
   if(!state.meditation || typeof state.meditation !== "object"){
     state.meditation = {startDate: MED_START_DEFAULT, sessions: {}};
   } else {
@@ -329,14 +354,14 @@ function migrateMed(state){
 async function loadCloud(){
   try{
     const res=await fetch(GAS_URL+"?key="+encodeURIComponent(API_KEY));
-    if(res.ok){const d=await res.json();if(d&&d.fields!==undefined)return d;}
+    if(res.ok){const d=await res.json();if(d&&!d.error&&d.fields!==undefined)return d;}
   }catch{}
   return new Promise((resolve)=>{
     const cb="_gcb"+Date.now();
     const timer=setTimeout(()=>{delete window[cb];resolve(null);},8000);
     window[cb]=(data)=>{
       clearTimeout(timer);delete window[cb];
-      try{if(typeof data==="string")data=JSON.parse(data);resolve(data&&data.fields!==undefined?data:null);}catch{resolve(null);}
+      try{if(typeof data==="string")data=JSON.parse(data);resolve(data&&!data.error&&data.fields!==undefined?data:null);}catch{resolve(null);}
     };
     const s=document.createElement("script");
     s.src=GAS_URL+"?key="+encodeURIComponent(API_KEY)+"&callback="+cb;
@@ -348,10 +373,17 @@ async function loadCloud(){
 
 async function saveCloud(d){
   const json=JSON.stringify(d);
+  // 1) fetch経路: v6 GASはJSONで結果を返すので保存の成否を検証できる
   try{
     const res=await fetch(GAS_URL+"?key="+encodeURIComponent(API_KEY),{method:"POST",body:json,headers:{"Content-Type":"text/plain"}});
-    if(res.ok) return true;
+    if(res.ok){
+      const r=await res.json().catch(()=>null);
+      if(r&&r.ok===true)return true;
+      if(r&&(r.ok===false||r.error))return false; // GASが失敗を報告
+      // 応答がJSONでない(旧GAS等) → iframe経路で再試行
+    }
   }catch{}
+  // 2) iframe(フォーム)経路: postMessageの結果を待つ。届かなければ失敗扱い(成功を偽装しない)
   return new Promise((resolve)=>{
     try{
       const fn="gsf"+Date.now();
@@ -359,7 +391,11 @@ async function saveCloud(d){
       ifr.name=fn;ifr.style.cssText="display:none;";
       document.body.appendChild(ifr);
       let done=false;
-      const onMsg=(ev)=>{if(ev.data==="gas_save_ok"){done=true;fin(true);}if(ev.data==="gas_save_error"){done=true;fin(false);}};
+      const onMsg=(ev)=>{
+        if(typeof ev.data!=="string")return;
+        if(ev.data==="gas_save_ok"){done=true;fin(true);}
+        else if(ev.data==="gas_save_error"){done=true;fin(false);}
+      };
       window.addEventListener("message",onMsg);
       const fin=(ok)=>{window.removeEventListener("message",onMsg);setTimeout(()=>{try{document.body.removeChild(frm);}catch{}try{document.body.removeChild(ifr);}catch{}},500);resolve(ok);};
       const frm=document.createElement("form");
@@ -370,18 +406,51 @@ async function saveCloud(d){
       const dataInp=document.createElement("input");
       dataInp.type="hidden";dataInp.name="data";dataInp.value=json;
       frm.appendChild(dataInp);document.body.appendChild(frm);frm.submit();
-      setTimeout(()=>{if(!done)fin(true);},6000);
+      setTimeout(()=>{if(!done)fin(false);},8000);
     }catch{resolve(false);}
   });
 }
 
+// 起動時ロード。
+// ・クラウドが空/エラー/接続不可のときはローカルを上書きしない(データ消失防止)
+// ・ローカルの方が新しい(オフライン編集など)ときはローカルを優先
 async function load(){
+  const local=loadLocal();
   const cloud=await loadCloud();
-  if(cloud){const m=migrateMed(cloud);saveLocal(m);return m;}
-  const local=await loadLocal();
-  return migrateMed(local);
+  if(cloud&&hasData(cloud)){
+    if(local&&hasData(local)&&(local.lastModified||0)>(cloud.lastModified||0)){
+      return {data:migrateMed(local),note:"local-newer"};
+    }
+    const m=migrateMed(cloud);saveLocal(m);return {data:m,note:"cloud"};
+  }
+  return {data:local?migrateMed(local):null,note:cloud?"cloud-empty":"cloud-fail"};
 }
 function save(d){saveLocal(d);}
+
+// logs を唯一の情報源として pagesRead を再計算(記録の追加/編集/削除での不整合を防ぐ)
+function recalcPagesRead(ns){
+  const sums={};
+  Object.values(ns.logs||{}).forEach(arr=>{
+    if(!Array.isArray(arr))return;
+    arr.forEach(e=>{sums[e.bid]=(sums[e.bid]||0)+(e.pg||0);});
+  });
+  ns.fields=(ns.fields||[]).map(f=>({...f,books:f.books.map(b=>({...b,pagesRead:Math.min(sums[b.id]||0,b.totalPages)}))}));
+  return ns;
+}
+
+// 瞑想の開始日を変更。目標変更履歴がなければ計画(genesis)も新開始日で再構築。
+function applyMedStartDate(state,newDate){
+  const meditation={...(state.meditation||{}),startDate:newDate,sessions:(state.meditation&&state.meditation.sessions)||{}};
+  const ns={...state,meditation};
+  const sch=state.medSchedule;
+  const isPureGenesis=!sch||(
+    Array.isArray(sch.past)&&sch.past.length===0&&
+    Array.isArray(sch.current)&&sch.current.length===1&&
+    sch.current[0].from===sch.current[0].vStart
+  );
+  if(isPureGenesis) ns.medSchedule=medGenesisSched(newDate);
+  return ns;
+}
 
 const DEF={fields:[],logs:{},meditation:{startDate:MED_START_DEFAULT,sessions:{}},studySchedule:genesisStudySched(),medSchedule:medGenesisSched(MED_START_DEFAULT)};
 
@@ -515,7 +584,7 @@ function DailyCompareChart({ data: rawData, w=540, h=220, successColor="#4ade80"
         const actH=d.actual!==null?(d.actual/maxY)*ph:0;
         return <g key={i}>
           {d.plan>0 && <rect x={cx-barW-gap/2} y={yS(d.plan)} width={barW} height={Math.max(planH,0.5)} rx={1} fill="rgba(255,255,255,0.15)"/>}
-          {d.actual!==null&&d.actual>0&&<rect x={cx+gap/2} y={yS(d.actual)} width={barW} height={Math.max(actH,0.5)} rx={1} fill={d.actual>=d.plan&&d.plan>0?successColor:failColor} opacity={0.8}/>}
+          {d.actual!==null&&d.actual>0&&<rect x={cx+gap/2} y={yS(d.actual)} width={barW} height={Math.max(actH,0.5)} rx={1} fill={d.plan>0?(d.actual>=d.plan?successColor:failColor):successColor} opacity={0.8}/>}
         </g>;
       })}
       {todayIdx>=0&&<>
@@ -869,12 +938,23 @@ function PlanTab({state,persist}) {
   const [medInp,setMedInp]=useState("");
   const [confirmMed,setConfirmMed]=useState(null);
 
+  // バリデーションメッセージ・削除確認・瞑想開始日
+  const [studyErr,setStudyErr]=useState("");
+  const [medErr,setMedErr]=useState("");
+  const [edErr,setEdErr]=useState("");
+  const [delField,setDelField]=useState(null);
+  const medStartCur=(state.meditation&&state.meditation.startDate)||MED_START_DEFAULT;
+  const [medStartInp,setMedStartInp]=useState(medStartCur);
+  const [confirmMedStart,setConfirmMedStart]=useState(false);
+  useEffect(()=>{setMedStartInp(medStartCur);},[medStartCur]);
+
   const studyHist=state.studySchedule||{past:[],current:segs,future:[]};
   const medHist=state.medSchedule||{past:[],current:medSegs,future:[]};
 
   function requestStudyApply(){
     const W=parseFloat(wkInp), E=parseFloat(weInp);
-    if(!(W>0)||!(E>0))return;
+    if(!(W>0)||!(E>0)){setStudyErr("平日・休日の目標には0より大きい数値を入力してください。");return;}
+    setStudyErr("");
     setConfirmStudy({W,E});
   }
   function doStudyApply(){
@@ -884,7 +964,8 @@ function PlanTab({state,persist}) {
   }
   function requestMedApply(){
     const M=parseFloat(medInp);
-    if(!(M>0))return;
+    if(!(M>0)){setMedErr("目標(分/日)には0より大きい数値を入力してください。");return;}
+    setMedErr("");
     const w=medInvPerSession(M);
     const snapped=medPerSessionByWeek(w);
     setConfirmMed({M,w,snapped,phase:medPhaseByWeek(w),practice:medDefaultPracticeByWeek(w)});
@@ -893,15 +974,37 @@ function PlanTab({state,persist}) {
     persist(applyMedTarget(state, confirmMed.M));
     setConfirmMed(null);setMedInp("");
   }
+  function requestMedStart(){
+    if(!medStartInp||isNaN(parseD(medStartInp).getTime())){setMedErr("開始日が正しくありません。");return;}
+    if(medStartInp===medStartCur){setMedErr("現在の開始日と同じです。");return;}
+    setMedErr("");
+    setConfirmMedStart(true);
+  }
+  function doMedStart(){
+    persist(applyMedStartDate(state,medStartInp));
+    setConfirmMedStart(false);
+  }
 
-  function openNew(){setBt("");setBp("");setBc("1.0");setEd({id:gid(),name:"",cat:"other",pct:"",startDate:GS,books:[]});}
-  function openEdit(f){setBt("");setBp("");setBc("1.0");setEd(JSON.parse(JSON.stringify(f)));}
-  function addBook(){const p=parseInt(bp);if(!bt||!p||p<=0)return;setEd(prev=>({...prev,books:[...prev.books,{id:gid(),title:bt,totalPages:p,coeff:parseFloat(bc)||1,pagesRead:0}]}));setBt("");setBp("");setBc("1.0");}
+  function openNew(){setBt("");setBp("");setBc("1.0");setEdErr("");setEd({id:gid(),name:"",cat:"other",pct:"",startDate:GS,books:[]});}
+  function openEdit(f){setBt("");setBp("");setBc("1.0");setEdErr("");setEd(JSON.parse(JSON.stringify(f)));}
+  function addBook(){
+    const p=parseInt(bp);
+    if(!bt){setEdErr("本のタイトルを入力してください。");return;}
+    if(!p||p<=0){setEdErr("本のページ数には0より大きい数値を入力してください。");return;}
+    setEdErr("");
+    setEd(prev=>({...prev,books:[...prev.books,{id:gid(),title:bt,totalPages:p,coeff:parseFloat(bc)||1,pagesRead:0}]}));
+    setBt("");setBp("");setBc("1.0");
+  }
   function removeBook(bid){setEd(prev=>({...prev,books:prev.books.filter(b=>b.id!==bid)}));}
   function updateBook(bid,key,val){setEd(prev=>({...prev,books:prev.books.map(b=>b.id!==bid?b:{...b,[key]:val})}));}
   function saveField(){
-    if(!ed||!ed.name||!ed.pct||ed.books.length===0)return;
-    const pn=parseFloat(ed.pct);if(!pn||pn<=0)return;
+    if(!ed)return;
+    if(!ed.name){setEdErr("分野名を入力してください。");return;}
+    const pn=parseFloat(ed.pct);
+    if(!pn||pn<=0){setEdErr("割合(%)には0より大きい数値を入力してください。");return;}
+    if(!ed.startDate||isNaN(parseD(ed.startDate).getTime())){setEdErr("開始日を入力してください。");return;}
+    if(ed.books.length===0){setEdErr("本を1冊以上追加してください。");return;}
+    setEdErr("");
     const f={...ed,pct:pn,books:ed.books.map(b=>({...b,
       totalPages:Math.max(1,b.totalPages||1),
       coeff:Math.max(0.1,b.coeff||1),
@@ -974,6 +1077,7 @@ function PlanTab({state,persist}) {
           <div style={{flex:1}}><label style={lb}>平日 目標(p/日)</label><input type="number" value={wkInp} onChange={e=>setWkInp(e.target.value)} style={{...inp,fontSize:15,fontWeight:700}}/></div>
           <div style={{flex:1}}><label style={lb}>休日 目標(p/日)</label><input type="number" value={weInp} onChange={e=>setWeInp(e.target.value)} style={{...inp,fontSize:15,fontWeight:700}}/></div>
         </div>
+        {studyErr&&<div style={{color:"#f87171",fontSize:11,marginBottom:8}}>{studyErr}</div>}
         <button onClick={requestStudyApply} style={{width:"100%",background:"rgba(251,191,36,0.14)",color:"#fbbf24",border:"1px solid rgba(251,191,36,0.3)",borderRadius:10,padding:"11px",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:8}}>この目標を適用</button>
         <HistoryControls
           canUndo={!!(studyHist.past&&studyHist.past.length)} canRedo={!!(studyHist.future&&studyHist.future.length)}
@@ -1053,7 +1157,7 @@ function PlanTab({state,persist}) {
                 </div>
                 <div style={{display:"flex",gap:6,flexShrink:0}}>
                   <button onClick={()=>openEdit(f)} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer"}}>編集</button>
-                  <button onClick={()=>persist({...state,fields:state.fields.filter(x=>x.id!==f.id)})} style={{background:"rgba(248,113,113,0.1)",color:"#f87171",border:"none",borderRadius:8,padding:"6px 8px",fontSize:12,cursor:"pointer"}}>×</button>
+                  <button onClick={()=>setDelField(f)} style={{background:"rgba(248,113,113,0.1)",color:"#f87171",border:"none",borderRadius:8,padding:"6px 8px",fontSize:12,cursor:"pointer"}}>×</button>
                 </div>
               </div>
               <div style={{marginTop:6,marginLeft:16}}>
@@ -1119,10 +1223,15 @@ function PlanTab({state,persist}) {
             <div style={{flex:1}}><label style={lb}>目標(分/日)</label><input type="number" value={medInp} onChange={e=>setMedInp(e.target.value)} placeholder={`現在: ${dailyTarget}`} style={{...inp,fontSize:15,fontWeight:700}}/></div>
             <button onClick={requestMedApply} style={{flex:1,background:`${MED_COLOR}22`,color:MED_COLOR,border:`1px solid ${MED_COLOR}44`,borderRadius:10,padding:"11px",fontSize:13,fontWeight:700,cursor:"pointer"}}>適用</button>
           </div>
+          {medErr&&<div style={{color:"#f87171",fontSize:11,marginBottom:8}}>{medErr}</div>}
           <HistoryControls
             canUndo={!!(medHist.past&&medHist.past.length)} canRedo={!!(medHist.future&&medHist.future.length)}
             undoCount={(medHist.past||[]).length} redoCount={(medHist.future||[]).length}
             onUndo={()=>persist(medUndo(state))} onRedo={()=>persist(medRedo(state))} accent={MED_COLOR}/>
+          <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid rgba(255,255,255,0.06)",display:"flex",gap:8,alignItems:"flex-end"}}>
+            <div style={{flex:2}}><label style={lb}>プログラム開始日</label><input type="date" value={medStartInp} onChange={e=>setMedStartInp(e.target.value)} style={inp}/></div>
+            <button onClick={requestMedStart} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.6)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:10,padding:"10px 8px",fontSize:12,fontWeight:600,cursor:"pointer"}}>開始日を変更</button>
+          </div>
         </div>
 
         <button onClick={()=>setShowProc(true)} style={{width:"100%",background:`${MED_COLOR}1a`,color:MED_COLOR,border:`1px solid ${MED_COLOR}44`,borderRadius:12,padding:"14px",fontSize:13,fontWeight:600,cursor:"pointer",letterSpacing:"0.05em"}}>📖 瞑想の手順を表示（タップで展開）</button>
@@ -1151,6 +1260,30 @@ function PlanTab({state,persist}) {
             "昨日までの計画は変更されません。"
           ]}
           onYes={doMedApply} onNo={()=>setConfirmMed(null)}/>
+      )}
+      {confirmMedStart && (
+        <ConfirmModal
+          title="瞑想の開始日を変更しますか？"
+          accent={MED_COLOR}
+          lines={[
+            `開始日: ${fF(medStartCur)} → ${fF(medStartInp)}`,
+            "目標変更の履歴がない場合、計画週の起点も新しい開始日になります。",
+            "記録済みのセッションはそのまま残ります。"
+          ]}
+          onYes={doMedStart} onNo={()=>setConfirmMedStart(false)}/>
+      )}
+      {delField && (
+        <ConfirmModal
+          title="分野を削除しますか？"
+          accent="#f87171"
+          yesLabel="削除する" noLabel="キャンセル"
+          lines={[
+            `「${delField.name}」(本${delField.books.length}冊)を削除します。`,
+            "計画・進捗・グラフから取り除かれます。",
+            "この操作は取り消せません。"
+          ]}
+          onYes={()=>{persist({...state,fields:state.fields.filter(x=>x.id!==delField.id)});setDelField(null);}}
+          onNo={()=>setDelField(null)}/>
       )}
 
       {ed&&(
@@ -1199,6 +1332,7 @@ function PlanTab({state,persist}) {
               <button onClick={addBook} style={{background:"rgba(74,222,128,0.15)",color:"#4ade80",border:"none",borderRadius:8,padding:"8px 12px",fontSize:13,cursor:"pointer"}}>+</button>
             </div>
             <div style={{color:"rgba(255,255,255,0.2)",fontSize:10,marginBottom:14}}>係数: 情報量が多い本→大(例:2.0), 軽い→小(例:0.5)。1実質page≈4分。</div>
+            {edErr&&<div style={{color:"#f87171",fontSize:12,marginBottom:10}}>{edErr}</div>}
             <div style={{display:"flex",gap:10}}>
               <button onClick={()=>setEd(null)} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13}}>キャンセル</button>
               <button onClick={saveField} style={{flex:1,background:"#fbbf24",color:"#000",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13,fontWeight:700}}>保存</button>
@@ -1724,20 +1858,20 @@ function DailyTab({state,persist}) {
   function saveLog(){
     const p=parseInt(pg);if(!sf||!sb||!p||p<=0)return;
     const ns=JSON.parse(JSON.stringify(state));
+    if(!ns.logs)ns.logs={};
     if(!ns.logs[vd])ns.logs[vd]=[];
     if(ei!==null&&ei<ns.logs[vd].length){
-      const old=ns.logs[vd][ei];
-      ns.fields=ns.fields.map(f=>f.id!==old.fid?f:{...f,books:f.books.map(b=>b.id!==old.bid?b:{...b,pagesRead:Math.max(0,b.pagesRead-old.pg)})});
       ns.logs[vd][ei]={fid:sf,bid:sb,pg:p};
-    }else{ns.logs[vd].push({fid:sf,bid:sb,pg:p});}
-    ns.fields=ns.fields.map(f=>f.id!==sf?f:{...f,books:f.books.map(b=>b.id!==sb?b:{...b,pagesRead:Math.min(b.pagesRead+p,b.totalPages)})});
+    }else{
+      ns.logs[vd].push({fid:sf,bid:sb,pg:p});
+    }
+    recalcPagesRead(ns); // pagesReadはlogsから再計算(加算/減算の不整合を防ぐ)
     persist(ns);reset();
   }
   function delLog(idx){
     const ns=JSON.parse(JSON.stringify(state));const arr=ns.logs[vd];if(!arr||idx>=arr.length)return;
-    const entry=arr[idx];
-    ns.fields=ns.fields.map(f=>f.id!==entry.fid?f:{...f,books:f.books.map(b=>b.id!==entry.bid?b:{...b,pagesRead:Math.max(0,b.pagesRead-entry.pg)})});
     arr.splice(idx,1);if(arr.length===0)delete ns.logs[vd];
+    recalcPagesRead(ns);
     persist(ns);reset();
   }
   function startEd(idx){const e=dl[idx];if(!e)return;setSf(e.fid);setSb(e.bid);setPg(String(e.pg));setEi(idx);}
@@ -1818,7 +1952,7 @@ function DailyTab({state,persist}) {
         <label style={lb}>分野</label>
         <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>
           {state.fields.map((f,i)=>(
-            <button key={f.id} onClick={()=>{setSf(f.id);setSb(null);setPg("");setEi(null);}} style={{
+            <button key={f.id} onClick={()=>{setSf(f.id);setSb(null);}} style={{
               background:sf===f.id?CL[i%CL.length]+"33":"rgba(255,255,255,0.04)",
               color:sf===f.id?CL[i%CL.length]:"rgba(255,255,255,0.5)",
               border:`1px solid ${sf===f.id?CL[i%CL.length]+"55":"rgba(255,255,255,0.08)"}`,
@@ -1850,7 +1984,7 @@ function DailyTab({state,persist}) {
           </div>
           <div style={{display:"flex",gap:8,marginTop:10}}>
             {ei!==null&&<button onClick={reset} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13}}>キャンセル</button>}
-            <button onClick={saveLog} style={{flex:1,background:"#fbbf24",color:"#000",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:14,fontWeight:700}}>{ei!==null?"更新":"記録する"}</button>
+            <button onClick={saveLog} disabled={!pg||!(parseInt(pg)>0)} style={{flex:1,background:pg&&parseInt(pg)>0?"#fbbf24":"rgba(255,255,255,0.06)",color:pg&&parseInt(pg)>0?"#000":"rgba(255,255,255,0.25)",border:"none",borderRadius:10,padding:12,cursor:pg&&parseInt(pg)>0?"pointer":"default",fontSize:14,fontWeight:700}}>{ei!==null?"更新":"記録する"}</button>
           </div>
         </>)}
       </div>
@@ -1896,37 +2030,66 @@ function App() {
   const [showCopyDone,setShowCopyDone]=useState(false);
   const [showAdvSync,setShowAdvSync]=useState(false);
   const [cloudStatus,setCloudStatus]=useState("");
+  const [confirmReset,setConfirmReset]=useState(false);
+  const [confirmPull,setConfirmPull]=useState(null);
 
   useEffect(()=>{
     (async()=>{
-      const d=await load();
-      if(d&&d.fields&&d.fields.length>0){setSt(migrateMed(d));setDataEmpty(false);}
-      else if(d&&migrateMed(d).meditation&&Object.keys(migrateMed(d).meditation.sessions||{}).length>0){
-        // 勉強分野はないが瞑想記録はある場合
-        setSt(migrateMed(d));setDataEmpty(false);
-      }
+      const {data:d,note}=await load();
+      if(d){setSt(d);setDataEmpty(!hasData(d));}
       else{setDataEmpty(true);}
       setLd(false);
+      if(note==="local-newer"&&d){
+        // この端末の方が新しい(オフライン編集など) → ローカルを表示しクラウドへ保存
+        setSyncMsg("ℹ️ この端末のデータの方が新しいため、そちらを表示してクラウドへ保存します。");
+        setCloudStatus("syncing");
+        const ok=await saveCloud(d);
+        setCloudStatus(ok?"ok":"error");
+        if(!ok)setSyncMsg("⚠️ この端末の新しいデータをクラウドへ保存できませんでした。「☁️ クラウドに保存」で再試行してください。");
+        setTimeout(()=>{setCloudStatus("");setSyncMsg("");},7000);
+      }else if(note==="cloud-fail"&&d&&hasData(d)){
+        setSyncMsg("⚠️ クラウドに接続できないため、この端末のデータを表示しています。");
+        setTimeout(()=>setSyncMsg(""),7000);
+      }
     })();
   },[]);
 
   const ps=useCallback(ns=>{
     const migrated=migrateMed(ns);
+    migrated.lastModified=Date.now();
     setSt(migrated);save(migrated);
-    setDataEmpty(!migrated.fields||migrated.fields.length===0);
-    // 瞑想記録があればdataEmpty=falseに
-    if(migrated.meditation && migrated.meditation.sessions && Object.keys(migrated.meditation.sessions).length>0){
-      setDataEmpty(false);
-    }
+    setDataEmpty(!hasData(migrated));
     setCloudStatus("syncing");
-    saveCloud(migrated).then(ok=>{setCloudStatus(ok?"ok":"error");setTimeout(()=>setCloudStatus(""),3000);});
+    saveCloud(migrated).then(ok=>{
+      setCloudStatus(ok?"ok":"error");
+      if(!ok){
+        setSyncMsg("❌ クラウド保存に失敗しました。データはこの端末には保存されています。「☁️ クラウドに保存」で再試行できます。");
+        setTimeout(()=>setSyncMsg(""),7000);
+      }
+      setTimeout(()=>setCloudStatus(""),3000);
+    });
   },[]);
 
-  async function pullCloud2(){
+  // 取得は「確認 → 置き換え」の2段階(未保存のローカル変更を黙って消さない)
+  async function requestPull(){
     setCloudStatus("syncing");setSyncMsg("");
     const d=await loadCloud();
-    if(d&&d.fields!==undefined){const m=migrateMed(d);setSt(m);saveLocal(m);setCloudStatus("ok");setSyncMsg("✅ クラウドから取得しました");setDataEmpty(false);}
-    else{setCloudStatus("error");setSyncMsg("❌ 取得失敗。接続を確認してください。");}
+    if(!d){
+      setCloudStatus("error");setSyncMsg("❌ クラウドから取得できませんでした。接続を確認してください。");
+      setTimeout(()=>{setCloudStatus("");setSyncMsg("");},5000);return;
+    }
+    if(!hasData(d)){
+      setCloudStatus("");setSyncMsg("⚠️ クラウドに有効なデータがないため、取得を中止しました。");
+      setTimeout(()=>setSyncMsg(""),5000);return;
+    }
+    setCloudStatus("");
+    setConfirmPull(d);
+  }
+  function doPull(){
+    const m=migrateMed(confirmPull);
+    setSt(m);saveLocal(m);setDataEmpty(!hasData(m));
+    setConfirmPull(null);
+    setCloudStatus("ok");setSyncMsg("✅ クラウドから取得しました");
     setTimeout(()=>{setCloudStatus("");setSyncMsg("");},4000);
   }
   async function pushCloud2(){
@@ -1964,7 +2127,7 @@ function App() {
           </div>
           <div style={{...card,borderColor:"rgba(74,222,128,0.2)"}}>
             <div style={{color:"#4ade80",fontSize:14,fontWeight:600,marginBottom:10}}>☁️ Google Docsから復元</div>
-            <button onClick={async()=>{setSyncMsg("⏳ 取得中...");const d=await loadCloud();if(d&&d.fields&&d.fields.length>0){const m=migrateMed(d);setSt(m);saveLocal(m);setDataEmpty(false);setSyncMsg("✅ 復元しました！");}else{setSyncMsg("❌ データが見つかりませんでした。");}}} style={{width:"100%",background:"#4ade80",color:"#000",border:"none",borderRadius:10,padding:"14px",fontSize:14,fontWeight:700,cursor:"pointer"}}>☁️ クラウドから復元</button>
+            <button onClick={async()=>{setSyncMsg("⏳ 取得中...");const d=await loadCloud();if(d&&hasData(d)){const m=migrateMed(d);setSt(m);saveLocal(m);setDataEmpty(false);setSyncMsg("✅ 復元しました！");}else{setSyncMsg("❌ クラウドに有効なデータが見つかりませんでした。");}}} style={{width:"100%",background:"#4ade80",color:"#000",border:"none",borderRadius:10,padding:"14px",fontSize:14,fontWeight:700,cursor:"pointer"}}>☁️ クラウドから復元</button>
           </div>
           <div style={{...card,borderColor:"rgba(129,140,248,0.2)"}}>
             <div style={{color:"#818cf8",fontSize:14,fontWeight:600,marginBottom:10}}>📥 手動で復元</div>
@@ -1991,9 +2154,15 @@ function App() {
               {cloudStatus==="syncing"?"⏳":cloudStatus==="ok"?"☁️✓":cloudStatus==="error"?"☁️✗":"☁️"}
             </span>
             <button onClick={()=>setShowAdvSync(!showAdvSync)} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,padding:"4px 10px",color:"rgba(255,255,255,0.5)",fontSize:10,cursor:"pointer"}}>🔄 同期</button>
-            <button onClick={()=>{if(window.confirm("全データをリセット？"))ps(DEF);}} style={{background:"none",border:"none",color:"rgba(255,255,255,0.12)",fontSize:10,cursor:"pointer"}}>リセット</button>
+            <button onClick={()=>setConfirmReset(true)} style={{background:"none",border:"none",color:"rgba(255,255,255,0.25)",fontSize:10,cursor:"pointer"}}>リセット</button>
           </div>
         </div>
+
+        {syncMsg&&!showAdvSync&&(
+          <div style={{...card,padding:"10px 14px",borderColor:syncMsg.startsWith("✅")?"rgba(74,222,128,0.25)":syncMsg.startsWith("❌")?"rgba(248,113,113,0.3)":"rgba(251,191,36,0.25)"}}>
+            <span style={{fontSize:12,color:syncMsg.startsWith("✅")?"#4ade80":syncMsg.startsWith("❌")?"#f87171":"#fbbf24"}}>{syncMsg}</span>
+          </div>
+        )}
 
         {showAdvSync && (
           <div style={{...card,borderColor:"rgba(129,140,248,0.2)"}}>
@@ -2002,7 +2171,7 @@ function App() {
               <button onClick={pushCloud2} disabled={cloudStatus==="syncing"} style={{flex:1,background:"rgba(74,222,128,0.08)",color:"#4ade80",border:"1px solid rgba(74,222,128,0.15)",borderRadius:8,padding:"10px",fontSize:12,fontWeight:600,cursor:"pointer"}}>
                 {cloudStatus==="syncing"?"⏳...":"☁️↑ 保存"}
               </button>
-              <button onClick={pullCloud2} disabled={cloudStatus==="syncing"} style={{flex:1,background:"rgba(129,140,248,0.08)",color:"#818cf8",border:"1px solid rgba(129,140,248,0.15)",borderRadius:8,padding:"10px",fontSize:12,fontWeight:600,cursor:"pointer"}}>
+              <button onClick={requestPull} disabled={cloudStatus==="syncing"} style={{flex:1,background:"rgba(129,140,248,0.08)",color:"#818cf8",border:"1px solid rgba(129,140,248,0.15)",borderRadius:8,padding:"10px",fontSize:12,fontWeight:600,cursor:"pointer"}}>
                 {cloudStatus==="syncing"?"⏳...":"☁️↓ 取得"}
               </button>
             </div>
@@ -2044,7 +2213,7 @@ function App() {
             }}>
               {cloudStatus==="syncing"?"⏳ 同期中...":cloudStatus==="ok"?"☁️✓ 保存済":"☁️ クラウドに保存"}
             </button>
-            <button onClick={pullCloud2} disabled={cloudStatus==="syncing"} style={{
+            <button onClick={requestPull} disabled={cloudStatus==="syncing"} style={{
               flex:1,
               background:"rgba(129,140,248,0.06)",border:"1px solid rgba(129,140,248,0.15)",
               borderRadius:10,padding:"10px 12px",
@@ -2060,6 +2229,33 @@ function App() {
             }}>{showCopyDone?"✅":"📋"}</button>
           </div>
         </div>
+      )}
+
+      {confirmReset && (
+        <ConfirmModal
+          title="全データをリセットしますか？"
+          accent="#f87171"
+          yesLabel="リセットする" noLabel="キャンセル"
+          lines={[
+            "この端末とクラウドの両方のデータが空になります。",
+            "必要なら先に「📋」ボタンでデータをコピーしてバックアップしてください。",
+            "この操作は取り消せません。"
+          ]}
+          onYes={()=>{setConfirmReset(false);ps(JSON.parse(JSON.stringify(DEF)));}}
+          onNo={()=>setConfirmReset(false)}/>
+      )}
+      {confirmPull && (
+        <ConfirmModal
+          title="クラウドのデータで置き換えますか？"
+          accent="#818cf8"
+          yesLabel="置き換える" noLabel="キャンセル"
+          lines={[
+            `クラウド: ${fmtTs(confirmPull.lastModified)} 保存`,
+            `この端末: ${fmtTs(st.lastModified)} 保存`,
+            ...((confirmPull.lastModified||0)<(st.lastModified||0)?["⚠️ クラウドのデータの方が古いようです。"]:[]),
+            "現在の表示内容はクラウドのデータで置き換えられます。"
+          ]}
+          onYes={doPull} onNo={()=>setConfirmPull(null)}/>
       )}
     </div>
   );

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>勉強+瞑想 計画トラッカー</title>
+<title>勉強+瞑想+アイケア 計画トラッカー</title>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&family=Shippori+Mincho:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
@@ -32,6 +32,13 @@ const MED_START_DEFAULT = "2026-05-05";
 const MED_COLOR = "#a78bfa";
 const MED_SLOTS = ["朝","夜","その他"];
 const MED_PRACTICES = ["数息観","隨息観","只管打坐"];
+
+// ═══ Constants (Eye care / アイケア) ═══
+// ドライアイ対策: 毎日10分目を温める。目標は10分/日で固定(プログラム進行なし)。
+const EYE_START_DEFAULT = "2026-07-11";
+const EYE_COLOR = "#fb923c";
+const EYE_TARGET_MIN = 10;
+const EYE_SLOTS = MED_SLOTS;
 
 // ═══ Date utils (timezone-safe) ═══
 function toStr(d) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; }
@@ -280,15 +287,16 @@ function medRedo(state) {
   const s = state.medSchedule; if (!s || !s.future.length) return state;
   return { ...state, medSchedule: { past: [ ...s.past, s.current ], current: s.future[0], future: s.future.slice(1) } };
 }
-function medCheckMissTwice(meditation) {
-  if (!meditation || !meditation.startDate) return null;
+// {startDate, sessions} 形式の共通判定(瞑想/アイケア)。
+function checkMissTwice(track) {
+  if (!track || !track.startDate) return null;
   const t = today();
-  if (t < meditation.startDate) return null;
-  const sessions = meditation.sessions || {};
+  if (t < track.startDate) return null;
+  const sessions = track.sessions || {};
   const has = d => Array.isArray(sessions[d]) && sessions[d].length > 0;
   const todayHas = has(t);
   let miss = 0, d = addD(t, -1);
-  while (d >= meditation.startDate && !has(d)) {
+  while (d >= track.startDate && !has(d)) {
     miss++;
     d = addD(d, -1);
     if (miss > 60) break;
@@ -302,6 +310,13 @@ function medCheckMissTwice(meditation) {
   return null;
 }
 
+// ═══ Eye care calc ═══
+// 目標は EYE_TARGET_MIN 分/日で固定。開始日以降のみ計画あり。
+function eyeDailyPlan(date, eyeCare) {
+  if (!eyeCare || !eyeCare.startDate) return 0;
+  return date >= eyeCare.startDate ? EYE_TARGET_MIN : 0;
+}
+
 // ═══ Storage ═══
 const SK="study-v6";
 // ※ v6 GAS (google-apps-script-v6.js) のデプロイが必要（応答形式が変わったため）
@@ -311,11 +326,12 @@ const API_KEY="kano_study_2026_secret";
 function loadLocal(){try{const r=localStorage.getItem(SK);return r?JSON.parse(r):null;}catch{return null;}}
 function saveLocal(d){try{localStorage.setItem(SK,JSON.stringify(d));}catch{}}
 
-// データとして意味のある内容(分野 or 瞑想記録)を持つか
+// データとして意味のある内容(分野 or 瞑想/アイケア記録)を持つか
 function hasData(d){
   if(!d)return false;
   if(Array.isArray(d.fields)&&d.fields.length>0)return true;
   if(d.meditation&&d.meditation.sessions&&Object.keys(d.meditation.sessions).length>0)return true;
+  if(d.eyeCare&&d.eyeCare.sessions&&Object.keys(d.eyeCare.sessions).length>0)return true;
   return false;
 }
 function fmtTs(ts){
@@ -333,6 +349,13 @@ function migrateMed(state){
   } else {
     if(!state.meditation.startDate) state.meditation.startDate = MED_START_DEFAULT;
     if(!state.meditation.sessions || typeof state.meditation.sessions !== "object") state.meditation.sessions = {};
+  }
+  // アイケア(目を温める)。なければ初期化。
+  if(!state.eyeCare || typeof state.eyeCare !== "object"){
+    state.eyeCare = {startDate: EYE_START_DEFAULT, sessions: {}};
+  } else {
+    if(!state.eyeCare.startDate) state.eyeCare.startDate = EYE_START_DEFAULT;
+    if(!state.eyeCare.sessions || typeof state.eyeCare.sessions !== "object") state.eyeCare.sessions = {};
   }
   // 勉強スケジュール(目標履歴)。なければ genesis(現行挙動を完全再現)で初期化。
   if(!state.studySchedule || !Array.isArray(state.studySchedule.current) || !state.studySchedule.current.length){
@@ -452,7 +475,7 @@ function applyMedStartDate(state,newDate){
   return ns;
 }
 
-const DEF={fields:[],logs:{},meditation:{startDate:MED_START_DEFAULT,sessions:{}},studySchedule:genesisStudySched(),medSchedule:medGenesisSched(MED_START_DEFAULT)};
+const DEF={fields:[],logs:{},meditation:{startDate:MED_START_DEFAULT,sessions:{}},eyeCare:{startDate:EYE_START_DEFAULT,sessions:{}},studySchedule:genesisStudySched(),medSchedule:medGenesisSched(MED_START_DEFAULT)};
 
 // ═══ Styles ═══
 const card={background:"linear-gradient(135deg,#0f1419,#1a1f2e)",borderRadius:16,padding:"18px 22px",border:"1px solid rgba(255,255,255,0.06)",marginBottom:16};
@@ -683,6 +706,27 @@ function buildMedDailyCompare(state, halfWeeks, offsetDays=0) {
     const d = addD(startD, i);
     const plan = (d >= med.startDate) ? medDailyPlan(d, medSegs) : 0;
     const sess = Array.isArray(med.sessions[d]) ? med.sessions[d] : [];
+    const actual = sess.reduce((s, x) => s + (x.duration || 0), 0);
+    const hasData = d <= t || sess.length > 0;
+    out.push({ d, lbl: fS(d), plan, actual: hasData ? actual : null, isToday: d === t });
+  }
+  return out;
+}
+
+function buildEyeDailyCompare(state, halfWeeks, offsetDays=0) {
+  const eye = state.eyeCare;
+  if (!eye || !eye.startDate) return [];
+  const t = today();
+  const halfDays = halfWeeks * 7;
+  const startD = addD(t, -halfDays+offsetDays);
+  const endD = addD(t, halfDays+offsetDays);
+  const totalDays = diffD(startD, endD) + 1;
+  if (totalDays <= 0) return [];
+  const out = [];
+  for (let i = 0; i < totalDays; i++) {
+    const d = addD(startD, i);
+    const plan = eyeDailyPlan(d, eye);
+    const sess = Array.isArray(eye.sessions[d]) ? eye.sessions[d] : [];
     const actual = sess.reduce((s, x) => s + (x.duration || 0), 0);
     const hasData = d <= t || sess.length > 0;
     out.push({ d, lbl: fS(d), plan, actual: hasData ? actual : null, isToday: d === t });
@@ -1045,6 +1089,8 @@ function PlanTab({state,persist}) {
 
   // Meditation plan summary
   const med=state.meditation||{startDate:MED_START_DEFAULT,sessions:{}};
+  // Eye care summary
+  const eye=state.eyeCare||{startDate:EYE_START_DEFAULT,sessions:{}};
   const t=today();
   const medPh=medPhase(t,medSegs);
   const medWk=medWeek(t,medSegs);
@@ -1237,6 +1283,29 @@ function PlanTab({state,persist}) {
         <button onClick={()=>setShowProc(true)} style={{width:"100%",background:`${MED_COLOR}1a`,color:MED_COLOR,border:`1px solid ${MED_COLOR}44`,borderRadius:12,padding:"14px",fontSize:13,fontWeight:600,cursor:"pointer",letterSpacing:"0.05em"}}>📖 瞑想の手順を表示（タップで展開）</button>
       </div>
 
+      {/* ═══ Eye care plan section ═══ */}
+      <div style={{marginTop:28,paddingTop:20,borderTop:`1px solid ${EYE_COLOR}22`}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,padding:"0 4px"}}>
+          <span style={{fontSize:18}}>♨️</span>
+          <span style={{color:EYE_COLOR,fontSize:13,fontWeight:600,letterSpacing:"0.04em"}}>アイケア</span>
+          <div style={{flex:1,height:1,background:`linear-gradient(90deg,${EYE_COLOR}33,transparent)`}}/>
+        </div>
+
+        <div style={{...card,borderColor:`${EYE_COLOR}22`,background:"linear-gradient(135deg,#17120a,#1f1a14)"}}>
+          <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,marginBottom:10}}>
+            開始: <span style={{color:EYE_COLOR,fontWeight:600}}>{fF(eye.startDate)}</span>
+          </div>
+          <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.9}}>
+            <div>目的: ドライアイ対策として毎日目を温める習慣をつける</div>
+            <div>回数は自由(1日の合計時間で達成判定)</div>
+          </div>
+          <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${EYE_COLOR}22`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{color:EYE_COLOR,fontSize:11,letterSpacing:"0.15em",fontStyle:"italic"}}>TARGET · FIXED</span>
+            <span style={{color:"#fff",fontSize:13,fontWeight:600}}>{EYE_TARGET_MIN}分/日 (固定)</span>
+          </div>
+        </div>
+      </div>
+
       {confirmStudy && (
         <ConfirmModal
           title="目標値を変更しますか？"
@@ -1359,6 +1428,7 @@ function ChartTab({state}) {
   const paData=useMemo(()=>buildPlanActualChart(state,hw,offsetDays),[state,hw,offsetDays]);
   const cum=useMemo(()=>calcCum(state,ff),[state,ff]);
   const medCompareData=useMemo(()=>buildMedDailyCompare(state,hw,offsetDays),[state,hw,offsetDays]);
+  const eyeCompareData=useMemo(()=>buildEyeDailyCompare(state,hw,offsetDays),[state,hw,offsetDays]);
   const sur=cum.pageDiff>=0;
   const tw=hw*2;
 
@@ -1389,6 +1459,7 @@ function ChartTab({state}) {
 
   const t=today();
   const med=state.meditation||{};
+  const eye=state.eyeCare||{startDate:EYE_START_DEFAULT,sessions:{}};
   const medPh=medPhase(t,medSegs);
   const medWk=medWeek(t,medSegs);
   const perSession=medPerSessionPlan(t,medSegs);
@@ -1577,6 +1648,62 @@ function ChartTab({state}) {
           </div>
         </div>
       </div>
+
+      {/* ═══ Eye care chart section ═══ */}
+      <div style={{marginTop:28,paddingTop:20,borderTop:`1px solid ${EYE_COLOR}22`}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,padding:"0 4px"}}>
+          <span style={{fontSize:18}}>♨️</span>
+          <span style={{color:EYE_COLOR,fontSize:13,fontWeight:600,letterSpacing:"0.04em"}}>アイケア</span>
+          <div style={{flex:1,height:1,background:`linear-gradient(90deg,${EYE_COLOR}33,transparent)`}}/>
+        </div>
+
+        <div style={{...card,borderColor:`${EYE_COLOR}22`,background:"linear-gradient(135deg,#17120a,#1f1a14)"}}>
+          {t < eye.startDate ? (
+            <div style={{textAlign:"center",padding:"8px 0"}}>
+              <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,marginBottom:6}}>アイケア開始予定日</div>
+              <div style={{color:EYE_COLOR,fontSize:18,fontWeight:600}}>{fF(eye.startDate)}</div>
+              <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:6}}>開始まであと {Math.max(0,diffD(t,eye.startDate))} 日</div>
+            </div>
+          ) : (
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div>
+                <div style={{color:EYE_COLOR,fontSize:11,letterSpacing:"0.15em",fontStyle:"italic",marginBottom:2}}>TARGET · FIXED</div>
+                <div style={{color:"rgba(255,255,255,0.5)",fontSize:11}}>ドライアイ対策 ── 目を温める</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{color:"#fff",fontSize:20,fontWeight:700}}>{EYE_TARGET_MIN}<span style={{fontSize:11,fontWeight:400}}>分</span>/日</div>
+                <div style={{color:EYE_COLOR,fontSize:11,marginTop:2}}>固定目標</div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div style={{...card,padding:"14px 6px 6px",borderColor:`${EYE_COLOR}1a`}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,padding:"0 16px"}}>
+            <span style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600}}>アイケア 計画 vs 実績（日別）</span>
+            <div style={{display:"flex",gap:12,alignItems:"center"}}>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <div style={{width:10,height:10,borderRadius:2,background:"rgba(255,255,255,0.15)"}}/>
+                <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>計画</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <div style={{width:10,height:10,borderRadius:2,background:EYE_COLOR}}/>
+                <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>達成</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <div style={{width:10,height:10,borderRadius:2,background:"#f87171"}}/>
+                <span style={{color:"rgba(255,255,255,0.3)",fontSize:9}}>未達</span>
+              </div>
+            </div>
+          </div>
+          <div {...panProps}>
+            <DailyCompareChart data={eyeCompareData} successColor={EYE_COLOR}/>
+          </div>
+          <div style={{padding:"4px 16px 8px",color:"rgba(255,255,255,0.25)",fontSize:10,textAlign:"right"}}>
+            単位: 分/日
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1603,7 +1730,7 @@ function MeditationSection({state, persist, vd, openProc}) {
   const totalActual=sessions.reduce((s,x)=>s+(x.duration||0),0);
   const pct=dailyTarget>0?Math.min(totalActual/dailyTarget*100,100):(totalActual>0?100:0);
 
-  const missAlert=useMemo(()=>isToday?medCheckMissTwice(med):null,[med,isToday]);
+  const missAlert=useMemo(()=>isToday?checkMissTwice(med):null,[med,isToday]);
 
   const reset=useCallback(()=>{setSlot(MED_SLOTS[0]);setPractice(null);setDur("");setEi(null);},[]);
 
@@ -1832,7 +1959,208 @@ function MeditationSection({state, persist, vd, openProc}) {
   );
 }
 
-// ═══ Tab 3: Daily Record (study + meditation) ═══
+// ═══ Eye care section (used inside DailyTab) ═══
+function EyeCareSection({state, persist, vd}) {
+  const [slot,setSlot]=useState(EYE_SLOTS[0]);
+  const [dur,setDur]=useState("");
+  const [ei,setEi]=useState(null);
+  const [celebrate,setCelebrate]=useState(false);
+
+  const eye=state.eyeCare||{startDate:EYE_START_DEFAULT,sessions:{}};
+  const t=today();
+  const isToday=vd===t;
+  const beforeStart=vd<eye.startDate;
+  const dailyTarget=EYE_TARGET_MIN;
+  const sessions=Array.isArray(eye.sessions[vd])?eye.sessions[vd]:[];
+  const totalActual=sessions.reduce((s,x)=>s+(x.duration||0),0);
+  const pct=dailyTarget>0?Math.min(totalActual/dailyTarget*100,100):(totalActual>0?100:0);
+
+  const missAlert=useMemo(()=>isToday?checkMissTwice(eye):null,[eye,isToday]);
+
+  const reset=useCallback(()=>{setSlot(EYE_SLOTS[0]);setDur("");setEi(null);},[]);
+
+  // 編集開始時にフォーム値を反映
+  useEffect(()=>{
+    if(ei!==null && sessions[ei]){
+      const e=sessions[ei];
+      setSlot(e.slot||EYE_SLOTS[0]);
+      setDur(String(e.duration||""));
+    }
+  // eslint-disable-next-line
+  },[ei]);
+
+  // 日付が変わったときフォームをリセット
+  useEffect(()=>{reset();},[vd,reset]);
+
+  function startEd(idx){
+    setEi(idx);
+  }
+
+  function saveSession(){
+    const d=parseInt(dur);if(!d||d<=0)return;
+    const ns=JSON.parse(JSON.stringify(state));
+    if(!ns.eyeCare) ns.eyeCare={startDate:EYE_START_DEFAULT,sessions:{}};
+    if(!ns.eyeCare.sessions) ns.eyeCare.sessions={};
+    if(!ns.eyeCare.sessions[vd]) ns.eyeCare.sessions[vd]=[];
+    const entry={slot,duration:d};
+    const isNew = ei===null;
+    if(ei!==null && ei<ns.eyeCare.sessions[vd].length){
+      ns.eyeCare.sessions[vd][ei]=entry;
+    } else {
+      ns.eyeCare.sessions[vd].push(entry);
+    }
+    persist(ns);
+    reset();
+    if(isNew){
+      setCelebrate(true);
+      setTimeout(()=>setCelebrate(false),1600);
+    }
+  }
+
+  function delSession(idx){
+    const ns=JSON.parse(JSON.stringify(state));
+    if(!ns.eyeCare || !ns.eyeCare.sessions || !Array.isArray(ns.eyeCare.sessions[vd])) return;
+    ns.eyeCare.sessions[vd].splice(idx,1);
+    if(ns.eyeCare.sessions[vd].length===0) delete ns.eyeCare.sessions[vd];
+    persist(ns);
+    reset();
+  }
+
+  const slotColor={"朝":"#fbbf24","夜":"#818cf8","その他":"#9ca3af"};
+
+  return (
+    <div style={{marginTop:28,paddingTop:20,borderTop:`1px solid ${EYE_COLOR}22`,position:"relative"}}>
+      {celebrate && (
+        <div style={{
+          position:"absolute",top:30,left:"50%",transform:"translateX(-50%)",zIndex:20,
+          background:`${EYE_COLOR}cc`,color:"#2e1a0f",padding:"12px 28px",borderRadius:14,
+          fontSize:18,fontWeight:700,letterSpacing:"0.1em",fontFamily:"'Shippori Mincho','Yu Mincho',serif",
+          boxShadow:`0 8px 32px ${EYE_COLOR}66`,
+          animation:"eyeFade 1.6s ease-out forwards"
+        }}>よし</div>
+      )}
+      <style>{`@keyframes eyeFade{0%{opacity:0;transform:translate(-50%,8px) scale(0.92)}15%{opacity:1;transform:translate(-50%,0) scale(1)}75%{opacity:1}100%{opacity:0;transform:translate(-50%,-4px) scale(1)}}`}</style>
+
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,padding:"0 4px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:18}}>♨️</span>
+          <span style={{color:EYE_COLOR,fontSize:13,fontWeight:600,letterSpacing:"0.04em"}}>アイケア</span>
+        </div>
+        <span style={{color:"rgba(255,255,255,0.3)",fontSize:10}}>ドライアイ対策 · 目を温める</span>
+      </div>
+
+      <div style={{...card,borderColor:`${EYE_COLOR}22`,background:"linear-gradient(135deg,#17120a,#1f1a14)"}}>
+        {beforeStart ? (
+          <div style={{textAlign:"center",padding:"6px 0"}}>
+            <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,marginBottom:6}}>アイケア開始日</div>
+            <div style={{color:EYE_COLOR,fontSize:16,fontWeight:600}}>{fF(eye.startDate)}</div>
+            <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:4}}>(この日付は開始前のため計画線なし。記録は可能)</div>
+          </div>
+        ) : (
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <div style={{color:EYE_COLOR,fontSize:11,letterSpacing:"0.15em",fontStyle:"italic",marginBottom:2}}>TARGET · FIXED</div>
+              <div style={{color:"rgba(255,255,255,0.5)",fontSize:11}}>毎日目を温めてドライアイを防ぐ</div>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <div style={{color:"#fff",fontSize:18,fontWeight:700}}>{EYE_TARGET_MIN}<span style={{fontSize:10,fontWeight:400}}>分</span>/日</div>
+              <div style={{color:EYE_COLOR,fontSize:11,marginTop:2}}>固定目標</div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {missAlert && (
+        <div style={{...card,borderColor:missAlert.level==="red"?"rgba(248,113,113,0.4)":"rgba(251,191,36,0.3)",background:missAlert.level==="red"?"linear-gradient(135deg,#1f1419,#1a1f2e)":"linear-gradient(135deg,#1f1a14,#1a1f2e)"}}>
+          <div style={{color:missAlert.level==="red"?"#f87171":"#fbbf24",fontSize:12,fontWeight:600}}>
+            {missAlert.level==="red"?"🚨":"⚠️"} {missAlert.text}
+          </div>
+        </div>
+      )}
+
+      {!beforeStart && (
+        <div style={{...card,borderColor:`${EYE_COLOR}1a`}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>進捗</span>
+            <span style={{color:totalActual>=dailyTarget?EYE_COLOR:"#fff",fontSize:18,fontWeight:700}}>
+              {totalActual}<span style={{fontSize:11,fontWeight:400,color:"rgba(255,255,255,0.4)"}}>/{dailyTarget}</span>
+              <span style={{fontSize:11,fontWeight:400,color:"rgba(255,255,255,0.4)"}}> 分</span>
+            </span>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{flex:1,background:"rgba(255,255,255,0.06)",borderRadius:6,height:8,overflow:"hidden"}}>
+              <div style={{width:`${pct}%`,height:"100%",background:pct>=100?EYE_COLOR:`linear-gradient(90deg,${EYE_COLOR}aa,${EYE_COLOR})`,borderRadius:6}}/>
+            </div>
+            <span style={{color:pct>=100?EYE_COLOR:"#fff",fontSize:13,fontWeight:700}}>{pct.toFixed(0)}%</span>
+          </div>
+          <div style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginTop:6,textAlign:"right"}}>
+            {sessions.length}回 記録済み
+          </div>
+        </div>
+      )}
+
+      <div style={{...card,borderColor:`${EYE_COLOR}1a`}}>
+        <div style={{color:EYE_COLOR,fontSize:12,fontWeight:600,marginBottom:10}}>
+          {ei!==null?"📝 セッションを編集":"✏️ セッションを記録"}
+        </div>
+
+        <label style={lb}>スロット</label>
+        <div style={{display:"flex",gap:6,marginBottom:10}}>
+          {EYE_SLOTS.map(s=>(
+            <button key={s} onClick={()=>setSlot(s)} style={{
+              flex:1,
+              background:slot===s?`${slotColor[s]}22`:"rgba(255,255,255,0.04)",
+              color:slot===s?slotColor[s]:"rgba(255,255,255,0.5)",
+              border:`1px solid ${slot===s?slotColor[s]+"55":"rgba(255,255,255,0.08)"}`,
+              borderRadius:8,padding:"8px 10px",fontSize:12,cursor:"pointer",fontWeight:slot===s?600:400
+            }}>{s}</button>
+          ))}
+        </div>
+
+        <label style={lb}>時間（分）</label>
+        <input type="number" value={dur} onChange={e=>setDur(e.target.value)} placeholder={`例: ${EYE_TARGET_MIN}`}
+          style={{...inp,fontSize:18,fontWeight:700,padding:"10px 14px"}} onKeyDown={e=>{if(e.key==="Enter")saveSession();}}/>
+
+        <div style={{display:"flex",gap:8,marginTop:12}}>
+          {ei!==null && <button onClick={reset} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13}}>キャンセル</button>}
+          <button onClick={saveSession} disabled={!dur||parseInt(dur)<=0} style={{
+            flex:2,
+            background:dur&&parseInt(dur)>0?EYE_COLOR:"rgba(255,255,255,0.04)",
+            color:dur&&parseInt(dur)>0?"#2e1a0f":"rgba(255,255,255,0.2)",
+            border:"none",borderRadius:10,padding:12,
+            cursor:dur&&parseInt(dur)>0?"pointer":"default",
+            fontSize:14,fontWeight:700
+          }}>{ei!==null?"更新":"記録する"}</button>
+        </div>
+      </div>
+
+      {sessions.length>0 && (
+        <div style={{...card,borderColor:`${EYE_COLOR}1a`}}>
+          <div style={{color:"rgba(255,255,255,0.5)",fontSize:12,fontWeight:600,marginBottom:8}}>📝 {fS(vd)} のセッション</div>
+          {sessions.map((s,i)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+              <div style={{flex:1,minWidth:0,display:"flex",alignItems:"center",gap:8}}>
+                <span style={{
+                  background:`${slotColor[s.slot]||"#9ca3af"}22`,
+                  color:slotColor[s.slot]||"#9ca3af",
+                  padding:"2px 8px",borderRadius:6,fontSize:10,fontWeight:600,minWidth:36,textAlign:"center"
+                }}>{s.slot||"?"}</span>
+                <span style={{color:EYE_COLOR,fontSize:11}}>目を温める</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+                <span style={{color:"rgba(255,255,255,0.7)",fontSize:13,fontWeight:600}}>{s.duration}<span style={{fontSize:10,fontWeight:400,color:"rgba(255,255,255,0.4)"}}>分</span></span>
+                <button onClick={()=>startEd(i)} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.4)",border:"none",borderRadius:6,padding:"3px 8px",fontSize:10,cursor:"pointer"}}>編集</button>
+                <button onClick={()=>delSession(i)} style={{background:"rgba(248,113,113,0.08)",color:"#f87171",border:"none",borderRadius:6,padding:"3px 8px",fontSize:10,cursor:"pointer"}}>削除</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══ Tab 3: Daily Record (study + meditation + eye care) ═══
 function DailyTab({state,persist}) {
   const [vd,setVd]=useState(today());
   const [sf,setSf]=useState(null);const [sb,setSb]=useState(null);const [pg,setPg]=useState("");const [ei,setEi]=useState(null);
@@ -1952,7 +2280,7 @@ function DailyTab({state,persist}) {
         <label style={lb}>分野</label>
         <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>
           {state.fields.map((f,i)=>(
-            <button key={f.id} onClick={()=>{setSf(f.id);setSb(null);}} style={{
+            <button key={f.id} onClick={()=>{setSf(f.id);setSb(null);setPg("");setEi(null);}} style={{
               background:sf===f.id?CL[i%CL.length]+"33":"rgba(255,255,255,0.04)",
               color:sf===f.id?CL[i%CL.length]:"rgba(255,255,255,0.5)",
               border:`1px solid ${sf===f.id?CL[i%CL.length]+"55":"rgba(255,255,255,0.08)"}`,
@@ -2015,6 +2343,9 @@ function DailyTab({state,persist}) {
 
       {/* ── Meditation section ── */}
       <MeditationSection state={state} persist={persist} vd={vd} openProc={()=>setShowProc(true)}/>
+
+      {/* ── Eye care section ── */}
+      <EyeCareSection state={state} persist={persist} vd={vd}/>
 
       {showProc && <MedProcedureModal onClose={()=>setShowProc(false)}/>}
     </div>
@@ -2122,7 +2453,7 @@ function App() {
         <div style={{maxWidth:540,margin:"0 auto",padding:"40px 16px"}}>
           <div style={{textAlign:"center",marginBottom:32}}>
             <div style={{fontSize:48,marginBottom:12}}>📚</div>
-            <h1 style={{color:"#fff",fontSize:22,fontWeight:700,margin:"0 0 8px"}}>勉強+瞑想 計画トラッカー</h1>
+            <h1 style={{color:"#fff",fontSize:22,fontWeight:700,margin:"0 0 8px"}}>勉強+瞑想+アイケア 計画トラッカー</h1>
             <p style={{color:"rgba(255,255,255,0.4)",fontSize:13,lineHeight:1.7}}>データが見つかりません。</p>
           </div>
           <div style={{...card,borderColor:"rgba(74,222,128,0.2)"}}>
@@ -2148,7 +2479,7 @@ function App() {
       <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
       <div style={{maxWidth:540,margin:"0 auto",padding:"16px 16px 120px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-          <h1 style={{color:"#fff",fontSize:17,fontWeight:700,margin:0}}>📚 勉強+瞑想 トラッカー</h1>
+          <h1 style={{color:"#fff",fontSize:17,fontWeight:700,margin:0}}>📚 勉強+瞑想+アイケア トラッカー</h1>
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
             <span style={{fontSize:9,color:cloudStatus==="ok"?"#4ade80":cloudStatus==="syncing"?"#fbbf24":cloudStatus==="error"?"#f87171":"rgba(255,255,255,0.2)"}}>
               {cloudStatus==="syncing"?"⏳":cloudStatus==="ok"?"☁️✓":cloudStatus==="error"?"☁️✗":"☁️"}
@@ -2200,7 +2531,7 @@ function App() {
         {tab==="daily"&&<DailyTab state={st} persist={ps}/>}
       </div>
 
-      {(st.fields.length>0 || (st.meditation && Object.keys(st.meditation.sessions||{}).length>0)) && (
+      {(st.fields.length>0 || (st.meditation && Object.keys(st.meditation.sessions||{}).length>0) || (st.eyeCare && Object.keys(st.eyeCare.sessions||{}).length>0)) && (
         <div style={{position:"fixed",bottom:0,left:0,right:0,background:"linear-gradient(0deg,#0a0e14 60%,transparent)",padding:"16px 16px 12px"}}>
           <div style={{maxWidth:540,margin:"0 auto",display:"flex",gap:8}}>
             <button onClick={pushCloud2} disabled={cloudStatus==="syncing"} style={{

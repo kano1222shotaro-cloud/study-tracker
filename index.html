@@ -4,6 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>勉強+瞑想+アイケア 計画トラッカー</title>
+<!--
+  v9 (2026-07-17): 分野の一時停止(ペンディング)/再開機能を追加。
+  ・分野の割合(%)は履歴管理(pctHist)になり、停止/再開/%変更は「指定日から適用」で過去の計画は凍結される
+  ・停止中はノルマ0、完了予定日は停止期間ぶん自動で後ろへ(再開日未定の間は「再開日未定」表示)
+  ・GAS(google-apps-script-v6.js)側の変更は不要
+-->
+
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&family=Shippori+Mincho:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
@@ -51,6 +58,8 @@ function fF(s) { const d=parseD(s); return `${d.getFullYear()}/${d.getMonth()+1}
 function fS(s) { const d=parseD(s); return `${d.getMonth()+1}/${d.getDate()}`; }
 function dw(s) { return ["日","月","火","水","木","金","土"][parseD(s).getDay()]; }
 const gid=()=>Math.random().toString(36).slice(2,10);
+// %表示用(小数1桁まで、整数なら整数表示)
+function fmtPct(v){ const r=Math.round((v||0)*10)/10; return Number.isInteger(r)?String(r):r.toFixed(1); }
 
 // ═══ Schedule (Study) ═══
 // 1日ノルマ(全分野合計)は「セグメント」の列で表される。
@@ -82,13 +91,68 @@ function dailyReq(date, segs) {
   }
   return Math.min(seg.weekday, seg.seedW.val + WEEKDAY_INCR * diffD(seg.seedW.date, date));
 }
-function fieldReq(f, date, segs) { if (!f.pct || date < f.startDate) return 0; return dailyReq(date, segs) * (f.pct / 100); }
+// ═══ 分野割合(%)の履歴 ═══
+// f.pctHist = [{from, pct}] (from昇順)。日付dの割合は「from<=d の最後のセグメント」の値。
+// 履歴を持たない旧データは「開始日から一定」として扱う(従来挙動と完全一致)。
+// f.pct は「今日時点の割合」を表す表示・旧バージョン互換用の値(migrateで常に同期)。
+// 割合の変更・一時停止(ペンディング)・再開はすべて履歴への追記で表現されるため、
+// 過去の計画(=過去日の割合)は書き換わらない。
+function getPctHist(f){
+  if(Array.isArray(f.pctHist)&&f.pctHist.length) return f.pctHist;
+  const p=typeof f.pct==="number"?f.pct:(parseFloat(f.pct)||0);
+  return [{from:f.startDate||GS,pct:p}];
+}
+function pctOnHist(hist,date){
+  let v=hist.length?hist[0].pct:0;
+  for(let i=0;i<hist.length;i++){ if(hist[i].from<=date) v=hist[i].pct; else break; }
+  return v;
+}
+function fieldPctOn(f,date){ return pctOnHist(getPctHist(f),date); }
+// 履歴を正規化: from昇順、同日は後勝ち、前と同値のセグメントは畳む
+function normPctHist(hist){
+  const h=[...hist].sort((a,b)=>a.from.localeCompare(b.from));
+  const out=[];
+  h.forEach(s=>{
+    const seg={from:s.from,pct:Math.max(0,parseFloat(s.pct)||0)};
+    const prev=out[out.length-1];
+    if(prev&&prev.from===seg.from){ if(out.length>=2&&Math.abs(out[out.length-2].pct-seg.pct)<1e-9){out.pop();}else{prev.pct=seg.pct;} return; }
+    if(prev&&Math.abs(prev.pct-seg.pct)<1e-9) return;
+    out.push(seg);
+  });
+  return out.length?out:[{from:GS,pct:0}];
+}
+// 「date以降の割合=pct」を適用。date以降に予定されていた変更は置き換えられる。
+function setPctFrom(hist,date,pct){
+  return normPctHist([...hist.filter(s=>s.from<date),{from:date,pct}]);
+}
+// 停止中か: その日の割合が0で、それ以前に割合>0の期間があった分野
+function isFieldPausedOn(f,date){
+  const h=getPctHist(f);
+  return pctOnHist(h,date)<=0 && h.some(s=>s.pct>0&&s.from<=date);
+}
+// 停止前の最後の割合(再開時のデフォルト値)
+function lastPositivePct(f,date){
+  const h=getPctHist(f);
+  let v=0;
+  h.forEach(s=>{ if(s.from<=date&&s.pct>0) v=s.pct; });
+  if(v<=0) h.forEach(s=>{ if(s.pct>0&&v<=0) v=s.pct; });
+  return v;
+}
+function fieldReq(f, date, segs) { const p=fieldPctOn(f,date); if (!p || date < f.startDate) return 0; return dailyReq(date, segs) * (p / 100); }
 function bookEff(b) { const tp=b.disabled?Math.min(b.pagesRead||0,b.totalPages):b.totalPages; return tp*(b.coeff||1); }
 function fieldEff(f) { return f.books.reduce((s,b)=>s+bookEff(b),0); }
 function fieldEnd(f, segs) {
-  const tot=fieldEff(f); if(tot<=0||!f.pct) return null;
+  const tot=fieldEff(f); if(tot<=0) return null;
+  const hist=getPctHist(f);
+  if(!hist.some(s=>s.pct>0)) return null;
+  const last=hist[hist.length-1];
   let cum=0,d=f.startDate;
-  for(let i=0;i<3650;i++){cum+=fieldReq(f,d,segs);if(cum>=tot)return d;d=addD(d,1);}
+  for(let i=0;i<3650;i++){
+    cum+=fieldReq(f,d,segs);
+    if(cum>=tot)return d;
+    if(d>=last.from&&last.pct<=0)return null; // 以降ずっと0%(停止中・再開日未定) → 完了予定なし
+    d=addD(d,1);
+  }
   return d;
 }
 
@@ -117,6 +181,53 @@ function studyRedo(state) {
 }
 // 現在の目標上限(最新セグメント)
 function curStudyCaps(segs) { const seg = segs[segs.length - 1]; return { weekday: seg.weekday, weekend: seg.weekend }; }
+
+// ═══ 割合の変更・一時停止(ペンディング)・再開 (すべて履歴ベースで過去は不変) ═══
+// fromDate 以降の各分野の割合を targets{fieldId:%} の値に確定する。
+// ・fromDate 以降に予定されていた割合変更は置き換えられる(それ以前の履歴は不変)
+// ・opts.restoreAt: その日に各対象分野を「fromDate時点の割合」へ自動復帰させる(再開予定日)
+// ・opts.pauseFid: 一時停止した分野のid(停止メタ情報 pause={since,until,snapshot} を付与)
+// ・opts.resumeFid: 再開した分野のid(pause を除去。fromDateが未来なら予定として保持)
+function applyAllocChange(state, fromDate, targets, opts) {
+  const o = opts || {};
+  const t = today();
+  const snapshot = {};
+  state.fields.forEach(f => { snapshot[f.id] = fieldPctOn(f, fromDate); });
+  const fields = state.fields.map(f => {
+    const has = Object.prototype.hasOwnProperty.call(targets, f.id);
+    if (!has && o.pauseFid !== f.id && o.resumeFid !== f.id) return f;
+    const nf = { ...f };
+    if (has) {
+      let hist = setPctFrom(getPctHist(f), fromDate, targets[f.id]);
+      if (o.restoreAt && o.restoreAt > fromDate && Math.abs(snapshot[f.id] - targets[f.id]) > 1e-9) {
+        hist = normPctHist([...hist, { from: o.restoreAt, pct: snapshot[f.id] }]);
+      }
+      nf.pctHist = hist;
+      nf.pct = pctOnHist(hist, t);
+    }
+    if (o.pauseFid === f.id) nf.pause = { since: fromDate, until: o.restoreAt || null, snapshot };
+    if (o.resumeFid === f.id && nf.pause) {
+      if (fromDate > t) nf.pause = { ...nf.pause, until: fromDate };
+      else delete nf.pause;
+    }
+    return nf;
+  });
+  return { ...state, fields };
+}
+
+// 分野編集画面での%変更を履歴に反映する。
+// ・新規分野 / まだ開始していない分野 / さかのぼり指定 → 開始日から一定で作り直し
+// ・開始済みの分野 → 「今日から適用」(過去の計画は凍結)
+function buildEditedPctHist(oldF, newStartDate, newPct, retro) {
+  const t = today();
+  if (!oldF || retro || newStartDate > t) return [{ from: newStartDate, pct: newPct }];
+  let hist = getPctHist(oldF);
+  if (oldF.startDate !== newStartDate) {
+    hist = normPctHist(hist.map(s => s.from === oldF.startDate ? { ...s, from: newStartDate } : s));
+  }
+  if (Math.abs(newPct - pctOnHist(hist, t)) > 1e-9) hist = setPctFrom(hist, t, newPct);
+  return hist;
+}
 function logsEff(f,logs) {
   let t=0; Object.values(logs).forEach(arr=>{
     if(!Array.isArray(arr))return;
@@ -136,12 +247,14 @@ function fieldComplete(f) {
 function getAllocOnDate(fields, date, segs, endMap) {
   let total = 0;
   fields.forEach(f => {
-    if (date < f.startDate || !f.pct) return;
+    if (date < f.startDate) return;
+    const p = fieldPctOn(f, date);
+    if (!p) return;
     const end = endMap ? endMap.get(f.id) : fieldEnd(f, segs);
     if (end && date > end) return;
-    total += f.pct;
+    total += p;
   });
-  return total;
+  return Math.round(total * 1000) / 1000; // 浮動小数の誤差を除去
 }
 
 function buildEndMap(fields, segs) {
@@ -150,16 +263,23 @@ function buildEndMap(fields, segs) {
   return m;
 }
 
-function findOverAllocDays(fields, segs) {
-  const endMap = buildEndMap(fields, segs);
+// 走査終端: 各分野の完了予定日に加え、割合変更・再開予定日も考慮する
+// (停止中(end=null)の分野の再開後の超過/不足も検知できるように)
+function allocScanEnd(fields, endMap, extraDays) {
   let maxEnd = GS;
   endMap.forEach(e => { if (e && e > maxEnd) maxEnd = e; });
-  const scanEnd = addD(maxEnd, 30);
+  fields.forEach(f => getPctHist(f).forEach(s => { if (s.from > maxEnd) maxEnd = s.from; }));
+  return addD(maxEnd, extraDays);
+}
+
+function findOverAllocDays(fields, segs) {
+  const endMap = buildEndMap(fields, segs);
+  const scanEnd = allocScanEnd(fields, endMap, 30);
   const issues = [];
   let d = GS;
   while (d <= scanEnd) {
     const alloc = getAllocOnDate(fields, d, segs, endMap);
-    if (alloc > 100) issues.push({ date: d, pct: alloc });
+    if (alloc > 100.001) issues.push({ date: d, pct: alloc });
     d = addD(d, 1);
     if (issues.length > 500) break;
   }
@@ -168,14 +288,12 @@ function findOverAllocDays(fields, segs) {
 
 function findUnderAllocDays(fields, segs) {
   const endMap = buildEndMap(fields, segs);
-  let maxEnd = GS;
-  endMap.forEach(e => { if (e && e > maxEnd) maxEnd = e; });
-  const scanEnd = addD(maxEnd, 7);
+  const scanEnd = allocScanEnd(fields, endMap, 7);
   const issues = [];
   let d = GS;
   while (d <= scanEnd) {
     const alloc = getAllocOnDate(fields, d, segs, endMap);
-    if (alloc > 0 && alloc < 100 && dailyReq(d, segs) > 0) issues.push({ date: d, pct: alloc });
+    if (alloc > 0 && alloc < 99.999 && dailyReq(d, segs) > 0) issues.push({ date: d, pct: alloc });
     d = addD(d, 1);
     if (issues.length > 500) break;
   }
@@ -344,6 +462,31 @@ function migrateMed(state){
   if(!state) return state;
   if(!Array.isArray(state.fields)) state.fields=[];
   if(!state.logs||typeof state.logs!=="object"||Array.isArray(state.logs)) state.logs={};
+  // 分野割合の履歴(pctHist)。なければ現行のpctから生成(開始日から一定=従来挙動を完全再現)。
+  // f.pct は常に「今日時点の割合」に同期する(表示・旧バージョン互換用)。
+  const _mt=today();
+  // f.pct が最後に同期された日 = 前回保存日。旧バージョンのアプリが f.pct だけを
+  // 書き換えた場合の検出は「前回保存日時点の履歴値」との比較で行う
+  // (再開予定日を跨いだだけの f.pct のズレを誤検出しないため)。
+  const _syncD=state.lastModified?toStr(new Date(state.lastModified)):null;
+  state.fields=state.fields.map(f=>{
+    const nf={...f};
+    let hist;
+    if(Array.isArray(nf.pctHist)&&nf.pctHist.length){
+      hist=normPctHist(nf.pctHist);
+      // 旧バージョンのアプリ等で f.pct だけが直接変更された場合は「今日から適用」として取り込む
+      const pn=typeof nf.pct==="number"?nf.pct:parseFloat(nf.pct);
+      if(_syncD&&isFinite(pn)&&Math.abs(pn-pctOnHist(hist,_syncD))>1e-9) hist=setPctFrom(hist,_mt,pn);
+    }else{
+      const pn=typeof nf.pct==="number"?nf.pct:(parseFloat(nf.pct)||0);
+      hist=[{from:nf.startDate||GS,pct:pn}];
+    }
+    nf.pctHist=hist;
+    nf.pct=pctOnHist(hist,_mt);
+    // 停止メタ情報の掃除(再開済み・自動復帰日を過ぎたものは外す)
+    if(nf.pause&&nf.pct>0&&(!nf.pause.until||nf.pause.until<=_mt)) delete nf.pause;
+    return nf;
+  });
   if(!state.meditation || typeof state.meditation !== "object"){
     state.meditation = {startDate: MED_START_DEFAULT, sessions: {}};
   } else {
@@ -639,7 +782,7 @@ function buildDailyCompare(state, ff, halfWeeks, offsetDays=0) {
     let dp=0;
     af.forEach(f=>{
       const end=endMap.get(f.id);
-      if(d>=f.startDate && f.pct && (!end||d<=end)) dp+=fieldReq(f,d,segs);
+      if(!end||d<=end) dp+=fieldReq(f,d,segs); // fieldReqが日付ごとの割合(停止含む)を反映
     });
     dp=Math.round(dp*10)/10;
     let da=0;
@@ -671,7 +814,7 @@ function buildPlanActualChart(state, halfWeeks, offsetDays=0) {
       fields.forEach((f,fi)=>{
         const end=endMap.get(f.id);
         let val=0;
-        if(d>=f.startDate && f.pct && (!end||d<=end)) val=fieldReq(f,d,segs);
+        if(!end||d<=end) val=fieldReq(f,d,segs); // fieldReqが日付ごとの割合(停止含む)を反映
         segments.push({fid:f.id,val,color:CL[fi%CL.length],dashed:true});
       });
     } else {
@@ -962,6 +1105,231 @@ function HistoryControls({canUndo, canRedo, onUndo, onRedo, accent="#fbbf24", un
   );
 }
 
+// ═══ 一時停止(ペンディング)/再開 共通パーツ ═══
+const PAUSE_C="#94a3b8";
+function AllocRow({color,name,note,sub,value,onChange}){
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+      <div style={{width:7,height:7,borderRadius:"50%",background:color,flexShrink:0}}/>
+      <div style={{flex:1,minWidth:0}}>
+        <span style={{color:"rgba(255,255,255,0.75)",fontSize:12,fontWeight:600}}>{name}</span>
+        {note&&<span style={{color:"rgba(255,255,255,0.3)",fontSize:10,marginLeft:6}}>{note}</span>}
+        {sub&&<div style={{color:"rgba(255,255,255,0.3)",fontSize:10}}>{sub}</div>}
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:4,flexShrink:0}}>
+        <input type="number" min="0" step="0.1" value={value} onChange={e=>onChange(e.target.value)}
+          style={{...inp,width:74,padding:"6px 8px",fontSize:13,fontWeight:700,textAlign:"right"}}/>
+        <span style={{color:"rgba(255,255,255,0.4)",fontSize:11}}>%</span>
+      </div>
+    </div>
+  );
+}
+function EndChangeList({changes,pausedName}){
+  if(!changes.length) return null;
+  return (
+    <div style={{background:"rgba(251,191,36,0.06)",border:"1px solid rgba(251,191,36,0.12)",borderRadius:10,padding:"10px 12px",marginBottom:12}}>
+      <div style={{color:"#fbbf24",fontSize:11,fontWeight:600,marginBottom:6}}>📅 完了予定日の変化</div>
+      {changes.map(c=>(
+        <div key={c.id} style={{display:"flex",justifyContent:"space-between",gap:8,padding:"2px 0"}}>
+          <span style={{color:"rgba(255,255,255,0.55)",fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.name}</span>
+          <span style={{color:"rgba(255,255,255,0.7)",fontSize:11,whiteSpace:"nowrap"}}>
+            {c.oe?fF(c.oe):"—"} → <span style={{color:c.ne?"#fbbf24":PAUSE_C,fontWeight:600}}>{c.ne?fF(c.ne):"再開日未定"}</span>
+          </span>
+        </div>
+      ))}
+      {pausedName&&<div style={{color:"rgba(255,255,255,0.3)",fontSize:10,marginTop:6}}>「{pausedName}」の完了予定日は停止期間のぶん自動的に後ろへ延びます。</div>}
+    </div>
+  );
+}
+// 対象分野の完了予定日の変化(旧→新)を計算
+function calcEndChanges(oldFields,newFields,targets,segs){
+  const out=[];
+  oldFields.forEach(f=>{
+    if(!Object.prototype.hasOwnProperty.call(targets,f.id))return;
+    const nf=newFields.find(x=>x.id===f.id);
+    if(!nf)return;
+    const oe=fieldEnd(f,segs),ne=fieldEnd(nf,segs);
+    if(String(oe)!==String(ne)) out.push({id:f.id,name:f.name,oe,ne});
+  });
+  return out;
+}
+function allocTotalLine(total){
+  const ok=Math.abs(total-100)<0.05;
+  return (
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0 2px"}}>
+      <span style={{color:"rgba(255,255,255,0.4)",fontSize:11}}>割当合計（対象分野）</span>
+      <span style={{color:ok?"#4ade80":total>100?"#f87171":"#fbbf24",fontSize:14,fontWeight:700}}>{fmtPct(total)}%</span>
+    </div>
+  );
+}
+
+// ═══ 一時停止(ペンディング) モーダル ═══
+// 停止日以降の日割りノルマを0にする。過去の計画・実績・遅れ/余剰は凍結されたまま変わらない。
+function PauseFieldModal({state,segs,field,onClose,onApply}){
+  const t=today();
+  const [fromDate,setFromDate]=useState(t);
+  const [resumeAt,setResumeAt]=useState("");
+  const [dist,setDist]=useState({});
+  const [err,setErr]=useState("");
+  const D=(fromDate&&!isNaN(parseD(fromDate).getTime()))?fromDate:t;
+  const freed=fieldPctOn(field,D);
+  const candidates=useMemo(()=>state.fields.filter(f=>f.id!==field.id&&!fieldComplete(f)&&fieldPctOn(f,D)>0),[state.fields,field.id,D]);
+  const sumOthers=candidates.reduce((s,f)=>s+fieldPctOn(f,D),0);
+  const setProportional=()=>{
+    const m={};candidates.forEach(f=>{const cur=fieldPctOn(f,D);m[f.id]=fmtPct(sumOthers>0?cur+freed*cur/sumOthers:cur);});setDist(m);
+  };
+  const setKeep=()=>{
+    const m={};candidates.forEach(f=>{m[f.id]=fmtPct(fieldPctOn(f,D));});setDist(m);
+  };
+  useEffect(()=>{setProportional();},[D,field.id]);
+  const targets=useMemo(()=>{
+    const m={};m[field.id]=0;
+    candidates.forEach(f=>{const v=parseFloat(dist[f.id]);m[f.id]=isFinite(v)&&v>=0?v:fieldPctOn(f,D);});
+    return m;
+  },[dist,candidates,field.id,D]);
+  const R=(resumeAt&&!isNaN(parseD(resumeAt).getTime())&&resumeAt>D)?resumeAt:null;
+  const nsPreview=useMemo(()=>applyAllocChange(state,D,targets,{restoreAt:R,pauseFid:field.id}),[state,D,targets,R,field.id]);
+  const endChanges=useMemo(()=>calcEndChanges(state.fields,nsPreview.fields,targets,segs),[state.fields,nsPreview,targets,segs]);
+  const total=Object.keys(targets).reduce((s,k)=>s+targets[k],0);
+  const willReplaceFuture=useMemo(()=>state.fields.some(f=>Object.prototype.hasOwnProperty.call(targets,f.id)&&getPctHist(f).some(s=>s.from>D)),[state.fields,targets,D]);
+  function doApply(){
+    if(D<field.startDate){setErr("停止開始日は分野の開始日以降にしてください。");return;}
+    if(D>t){setErr("停止開始日は今日以前にしてください。");return;}
+    if(resumeAt&&resumeAt<=D){setErr("再開予定日は停止開始日より後にしてください。");return;}
+    onApply(applyAllocChange(state,D,targets,{restoreAt:R,pauseFid:field.id}));
+  }
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.72)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#161b26",borderRadius:20,padding:24,maxWidth:460,width:"100%",border:`1px solid ${PAUSE_C}33`,maxHeight:"88vh",overflow:"auto"}}>
+        <h3 style={{color:"#fff",fontSize:17,fontWeight:700,margin:"0 0 6px"}}>⏸ 「{field.name}」を一時停止</h3>
+        <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.7,marginBottom:14}}>
+          停止日以降、この分野の日割りノルマは0になります。<br/>
+          過去の計画・実績・遅れ/余剰はそのまま凍結され、変わりません。
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          <div style={{flex:1}}><label style={lb}>停止開始日</label><input type="date" value={fromDate} max={t} min={field.startDate} onChange={e=>setFromDate(e.target.value)} style={inp}/></div>
+          <div style={{flex:1}}><label style={lb}>再開予定日（任意）</label><input type="date" value={resumeAt} min={addD(D,1)} onChange={e=>setResumeAt(e.target.value)} style={inp}/></div>
+        </div>
+        <div style={{color:"rgba(255,255,255,0.3)",fontSize:10,marginBottom:14,lineHeight:1.6}}>
+          再開予定日を設定すると、その日に停止前の配分へ自動で戻ります。空欄の場合は「▶ 再開」を押すまで停止が続きます。
+        </div>
+        <div style={{borderTop:"1px solid rgba(255,255,255,0.06)",paddingTop:12,marginBottom:4}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+            <span style={{color:"rgba(255,255,255,0.6)",fontSize:12,fontWeight:600}}>空いた {fmtPct(freed)}% の再配分</span>
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={setProportional} style={{background:"rgba(251,191,36,0.12)",color:"#fbbf24",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>比例配分</button>
+              <button onClick={setKeep} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>配分しない</button>
+            </div>
+          </div>
+          {candidates.length===0&&<div style={{color:"rgba(255,255,255,0.25)",fontSize:11,padding:"8px 0"}}>再配分できる稼働中の分野がありません。</div>}
+          {candidates.map(f=>{
+            const idx=state.fields.findIndex(x=>x.id===f.id);
+            return <AllocRow key={f.id} color={CL[idx%CL.length]} name={f.name}
+              note={f.startDate>D?`${fS(f.startDate)}開始`:null}
+              sub={`現在 ${fmtPct(fieldPctOn(f,D))}%`}
+              value={dist[f.id]??""} onChange={v=>setDist(prev=>({...prev,[f.id]:v}))}/>;
+          })}
+          {allocTotalLine(total)}
+        </div>
+        <EndChangeList changes={endChanges} pausedName={field.name}/>
+        {willReplaceFuture&&<div style={{color:"#fbbf24",fontSize:10,marginBottom:10}}>⚠️ {fF(D)}以降に予定されていた割合変更は、この内容で置き換えられます。</div>}
+        {err&&<div style={{color:"#f87171",fontSize:12,marginBottom:10}}>{err}</div>}
+        <div style={{display:"flex",gap:10}}>
+          <button onClick={onClose} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13}}>キャンセル</button>
+          <button onClick={doApply} style={{flex:1,background:PAUSE_C,color:"#0a0e14",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13,fontWeight:700}}>⏸ 停止する</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══ 再開 モーダル ═══
+// 再開日以降の割合を確定する(再開日以降に予定されていた変更は置き換え)。
+// 他の停止中分野には触れない(それぞれの停止スケジュールは保持される)。
+function ResumeFieldModal({state,segs,field,onClose,onApply}){
+  const t=today();
+  const [fromDate,setFromDate]=useState(t);
+  const [vals,setVals]=useState({});
+  const [err,setErr]=useState("");
+  const D=(fromDate&&!isNaN(parseD(fromDate).getTime()))?fromDate:t;
+  const snap=(field.pause&&field.pause.snapshot)||null;
+  const since=(field.pause&&field.pause.since)||null;
+  const others=useMemo(()=>state.fields.filter(f=>f.id!==field.id&&!fieldComplete(f)&&fieldPctOn(f,D)>0),[state.fields,field.id,D]);
+  const selfDefault=(snap&&snap[field.id]>0)?snap[field.id]:lastPositivePct(field,D);
+  const setFromSnap=()=>{
+    const m={};m[field.id]=fmtPct(selfDefault);
+    others.forEach(f=>{m[f.id]=fmtPct(snap&&isFinite(snap[f.id])&&snap[f.id]>0?snap[f.id]:fieldPctOn(f,D));});
+    setVals(m);
+  };
+  const setCurrent=()=>{
+    const m={};m[field.id]=fmtPct(selfDefault);
+    others.forEach(f=>{m[f.id]=fmtPct(fieldPctOn(f,D));});
+    setVals(m);
+  };
+  useEffect(()=>{setFromSnap();},[field.id]);
+  const targets=useMemo(()=>{
+    const m={};
+    const sv=parseFloat(vals[field.id]);m[field.id]=isFinite(sv)&&sv>0?sv:selfDefault;
+    others.forEach(f=>{const v=parseFloat(vals[f.id]);m[f.id]=isFinite(v)&&v>=0?v:fieldPctOn(f,D);});
+    return m;
+  },[vals,others,field.id,selfDefault,D]);
+  const nsPreview=useMemo(()=>applyAllocChange(state,D,targets,{resumeFid:field.id}),[state,D,targets,field.id]);
+  const endChanges=useMemo(()=>calcEndChanges(state.fields,nsPreview.fields,targets,segs),[state.fields,nsPreview,targets,segs]);
+  const total=Object.keys(targets).reduce((s,k)=>s+targets[k],0);
+  const fidx=state.fields.findIndex(x=>x.id===field.id);
+  function doApply(){
+    const sv=parseFloat(vals[field.id]);
+    if(!(sv>0)){setErr("再開後の割合(%)には0より大きい数値を入力してください。");return;}
+    if(D<field.startDate){setErr("再開日は分野の開始日以降にしてください。");return;}
+    if(since&&D<since){setErr(`再開日は停止開始日(${fF(since)})以降にしてください。`);return;}
+    onApply(applyAllocChange(state,D,targets,{resumeFid:field.id}));
+  }
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.72)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#161b26",borderRadius:20,padding:24,maxWidth:460,width:"100%",border:"1px solid rgba(74,222,128,0.25)",maxHeight:"88vh",overflow:"auto"}}>
+        <h3 style={{color:"#fff",fontSize:17,fontWeight:700,margin:"0 0 6px"}}>▶ 「{field.name}」を再開</h3>
+        <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.7,marginBottom:14}}>
+          {since?`${fF(since)}から停止中です。`:"現在停止中です。"}再開日以降の配分を下で確定します。<br/>
+          停止していた期間の計画は0のまま残ります（さかのぼって積み上がりません）。
+        </div>
+        <div style={{marginBottom:12}}>
+          <label style={lb}>再開日（未来の日付なら予定として保存）</label>
+          <input type="date" value={fromDate} min={since&&since>field.startDate?since:field.startDate} onChange={e=>setFromDate(e.target.value)} style={inp}/>
+        </div>
+        <div style={{borderTop:"1px solid rgba(255,255,255,0.06)",paddingTop:12,marginBottom:4}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+            <span style={{color:"rgba(255,255,255,0.6)",fontSize:12,fontWeight:600}}>再開後の配分</span>
+            <div style={{display:"flex",gap:6}}>
+              {snap&&<button onClick={setFromSnap} style={{background:"rgba(74,222,128,0.12)",color:"#4ade80",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>停止前に戻す</button>}
+              <button onClick={setCurrent} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>他は現状維持</button>
+            </div>
+          </div>
+          <AllocRow color={CL[(fidx>=0?fidx:0)%CL.length]} name={field.name} note="再開する分野"
+            sub={snap&&snap[field.id]>0?`停止前 ${fmtPct(snap[field.id])}%`:null}
+            value={vals[field.id]??""} onChange={v=>setVals(prev=>({...prev,[field.id]:v}))}/>
+          {others.map(f=>{
+            const idx=state.fields.findIndex(x=>x.id===f.id);
+            return <AllocRow key={f.id} color={CL[idx%CL.length]} name={f.name}
+              note={f.startDate>D?`${fS(f.startDate)}開始`:null}
+              sub={`現在 ${fmtPct(fieldPctOn(f,D))}%${snap&&isFinite(snap[f.id])?` · 停止前 ${fmtPct(snap[f.id])}%`:""}`}
+              value={vals[f.id]??""} onChange={v=>setVals(prev=>({...prev,[f.id]:v}))}/>;
+          })}
+          {allocTotalLine(total)}
+        </div>
+        <EndChangeList changes={endChanges} pausedName={null}/>
+        <div style={{color:"rgba(255,255,255,0.3)",fontSize:10,marginBottom:10,lineHeight:1.6}}>
+          {fF(D)}以降に予定されていた割合変更（自動復帰の予定を含む）は、この内容で置き換えられます。
+        </div>
+        {err&&<div style={{color:"#f87171",fontSize:12,marginBottom:10}}>{err}</div>}
+        <div style={{display:"flex",gap:10}}>
+          <button onClick={onClose} style={{flex:1,background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13}}>キャンセル</button>
+          <button onClick={doApply} style={{flex:1,background:"#4ade80",color:"#0a0e14",border:"none",borderRadius:10,padding:12,cursor:"pointer",fontSize:13,fontWeight:700}}>▶ 再開する</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ═══ Tab 1: Plan ═══
 function PlanTab({state,persist}) {
   const [ed,setEd]=useState(null);
@@ -987,6 +1355,8 @@ function PlanTab({state,persist}) {
   const [medErr,setMedErr]=useState("");
   const [edErr,setEdErr]=useState("");
   const [delField,setDelField]=useState(null);
+  const [pauseF,setPauseF]=useState(null);
+  const [resumeF,setResumeF]=useState(null);
   const medStartCur=(state.meditation&&state.meditation.startDate)||MED_START_DEFAULT;
   const [medStartInp,setMedStartInp]=useState(medStartCur);
   const [confirmMedStart,setConfirmMedStart]=useState(false);
@@ -1045,15 +1415,19 @@ function PlanTab({state,persist}) {
     if(!ed)return;
     if(!ed.name){setEdErr("分野名を入力してください。");return;}
     const pn=parseFloat(ed.pct);
-    if(!pn||pn<=0){setEdErr("割合(%)には0より大きい数値を入力してください。");return;}
+    if(isNaN(pn)||pn<0){setEdErr("割合(%)には0以上の数値を入力してください。(0=停止と同じ扱い)");return;}
     if(!ed.startDate||isNaN(parseD(ed.startDate).getTime())){setEdErr("開始日を入力してください。");return;}
     if(ed.books.length===0){setEdErr("本を1冊以上追加してください。");return;}
     setEdErr("");
-    const f={...ed,pct:pn,books:ed.books.map(b=>({...b,
+    const old=state.fields.find(x=>x.id===ed.id);
+    // %変更は「今日から適用」(過去の計画は凍結)。retroPct指定時のみ全期間を書き直す。
+    const hist=buildEditedPctHist(old,ed.startDate,pn,!!ed.retroPct);
+    const f={...ed,pctHist:hist,pct:pctOnHist(hist,today()),books:ed.books.map(b=>({...b,
       totalPages:Math.max(1,b.totalPages||1),
       coeff:Math.max(0.1,b.coeff||1),
       pagesRead:Math.min(b.pagesRead||0,Math.max(1,b.totalPages||1))
     }))};
+    delete f.retroPct;
     const idx=state.fields.findIndex(x=>x.id===f.id);
     persist({...state,fields:idx>=0?state.fields.map(x=>x.id===f.id?f:x):[...state.fields,f]});
     setEd(null);
@@ -1081,10 +1455,13 @@ function PlanTab({state,persist}) {
   },[state.fields]);
 
   const previewEnd = useMemo(()=>{
-    if(!ed||ed.books.length===0||!ed.pct)return null;
-    const pn=parseFloat(ed.pct);if(!pn||pn<=0)return null;
-    return fieldEnd({...ed,pct:pn},segs);
-  },[ed,segs]);
+    if(!ed||ed.books.length===0||!ed.startDate)return null;
+    const pn=parseFloat(ed.pct);if(!(pn>0))return null;
+    // 保存時と同じロジックで履歴を組み立ててから完了予定日を計算(保存後の実際の値と一致させる)
+    const old=state.fields.find(x=>x.id===ed.id);
+    const hist=buildEditedPctHist(old,ed.startDate,pn,!!ed.retroPct);
+    return fieldEnd({...ed,pct:pn,pctHist:hist},segs);
+  },[ed,segs,state.fields]);
   const previewEff=ed?ed.books.reduce((s,b)=>s+bookEff(b),0):0;
 
   // Meditation plan summary
@@ -1137,7 +1514,7 @@ function PlanTab({state,persist}) {
           <span style={{color:"#fbbf24",fontSize:20,fontWeight:700}}>{dailyReq(today(),segs).toFixed(1)}<span style={{fontSize:12,fontWeight:400}}> 実質p</span></span>
         </div>
         <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:4,textAlign:"right"}}>
-          今日の割当: <span style={{color:todayAlloc===100?"#4ade80":todayAlloc>100?"#f87171":"#fbbf24",fontWeight:600}}>{todayAlloc}%</span>
+          今日の割当: <span style={{color:Math.abs(todayAlloc-100)<0.05?"#4ade80":todayAlloc>100?"#f87171":"#fbbf24",fontWeight:600}}>{fmtPct(todayAlloc)}%</span>
         </div>
       </div>
 
@@ -1147,7 +1524,7 @@ function PlanTab({state,persist}) {
           <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.8}}>
             {overRanges.map((r,i)=>(
               <div key={i}>
-                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#f87171",fontWeight:600}}>{r.pct}%</span>
+                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#f87171",fontWeight:600}}>{fmtPct(r.pct)}%</span>
               </div>
             ))}
             {overDays.length>10 && <div style={{color:"rgba(255,255,255,0.2)"}}>…他{overDays.length-10}日</div>}
@@ -1161,7 +1538,7 @@ function PlanTab({state,persist}) {
           <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.8}}>
             {underSoonRanges.map((r,i)=>(
               <div key={i}>
-                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#f87171",fontWeight:600}}>{r.pct}%</span>
+                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#f87171",fontWeight:600}}>{fmtPct(r.pct)}%</span>
               </div>
             ))}
           </div>
@@ -1174,7 +1551,7 @@ function PlanTab({state,persist}) {
           <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.8}}>
             {underLaterRanges.map((r,i)=>(
               <div key={i}>
-                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#fbbf24",fontWeight:600}}>{r.pct}%</span>
+                {fF(r.from)}{r.from!==r.to?` 〜 ${fF(r.to)}`:""}：<span style={{color:"#fbbf24",fontWeight:600}}>{fmtPct(r.pct)}%</span>
               </div>
             ))}
           </div>
@@ -1187,21 +1564,29 @@ function PlanTab({state,persist}) {
           const col=CL[i%CL.length];
           const te=fieldEff(f);const end=fieldEnd(f,segs);const ae=logsEff(f,state.logs);
           const pct=te>0?Math.min(ae/te*100,100):0;
+          const curP=fieldPctOn(f,t);
+          const paused=!done&&isFieldPausedOn(f,t);
+          const since=(f.pause&&f.pause.since)||null;
+          const until=(f.pause&&f.pause.until&&f.pause.until>t)?f.pause.until:null;
           return (
-            <div key={f.id} style={{background:done?"rgba(255,255,255,0.015)":"rgba(255,255,255,0.03)",borderRadius:12,padding:"12px 16px",marginBottom:8,border:`1px solid ${col}${done?"14":"22"}`,opacity:done?0.5:1}}>
+            <div key={f.id} style={{background:done?"rgba(255,255,255,0.015)":"rgba(255,255,255,0.03)",borderRadius:12,padding:"12px 16px",marginBottom:8,border:`1px solid ${paused?PAUSE_C+"44":col+(done?"14":"22")}`,opacity:done?0.5:1}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
                 <div style={{flex:1}}>
-                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
                     <div style={{width:8,height:8,borderRadius:"50%",background:col}}/>
                     <span style={{color:"#fff",fontWeight:600,fontSize:14}}>{f.name}</span>
-                    <span style={{color:col,fontSize:12,fontWeight:700}}>{f.pct}%</span>
+                    <span style={{color:paused?PAUSE_C:col,fontSize:12,fontWeight:700}}>{fmtPct(curP)}%</span>
                     {done&&<span style={{color:"#4ade80",fontSize:10,fontWeight:600,marginLeft:2}}>✓ 完了</span>}
+                    {paused&&<span style={{background:PAUSE_C+"22",color:PAUSE_C,fontSize:10,fontWeight:600,borderRadius:6,padding:"1px 7px"}}>⏸ 停止中{since?` ${fS(since)}〜`:""}{until?fS(until):""}</span>}
                   </div>
                   <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:3,marginLeft:16}}>
-                    {fF(f.startDate)}〜{end?fF(end):""} · {f.books.length}冊 · 実質{te.toFixed(0)}p
+                    {fF(f.startDate)}〜{end?fF(end):(paused?"（再開日未定）":"")} · {f.books.length}冊 · 実質{te.toFixed(0)}p
                   </div>
                 </div>
                 <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  {!done&&(paused
+                    ?<button onClick={()=>setResumeF(f)} style={{background:"rgba(74,222,128,0.12)",color:"#4ade80",border:"none",borderRadius:8,padding:"6px 10px",fontSize:12,cursor:"pointer",fontWeight:600}}>▶ 再開</button>
+                    :(f.startDate<=t&&curP>0?<button onClick={()=>setPauseF(f)} style={{background:PAUSE_C+"1f",color:PAUSE_C,border:"none",borderRadius:8,padding:"6px 10px",fontSize:12,cursor:"pointer",fontWeight:600}}>⏸ 停止</button>:null))}
                   <button onClick={()=>openEdit(f)} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer"}}>編集</button>
                   <button onClick={()=>setDelField(f)} style={{background:"rgba(248,113,113,0.1)",color:"#f87171",border:"none",borderRadius:8,padding:"6px 8px",fontSize:12,cursor:"pointer"}}>×</button>
                 </div>
@@ -1355,6 +1740,11 @@ function PlanTab({state,persist}) {
           onNo={()=>setDelField(null)}/>
       )}
 
+      {pauseF&&<PauseFieldModal state={state} segs={segs} field={pauseF}
+        onClose={()=>setPauseF(null)} onApply={ns=>{persist(ns);setPauseF(null);}}/>}
+      {resumeF&&<ResumeFieldModal state={state} segs={segs} field={resumeF}
+        onClose={()=>setResumeF(null)} onApply={ns=>{persist(ns);setResumeF(null);}}/>}
+
       {ed&&(
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
           <div style={{background:"#1a1f2e",borderRadius:20,padding:24,maxWidth:460,width:"100%",border:"1px solid rgba(255,255,255,0.1)",maxHeight:"88vh",overflow:"auto"}}>
@@ -1367,6 +1757,29 @@ function PlanTab({state,persist}) {
               <div style={{flex:1}}><label style={lb}>割合(%)</label><input type="number" value={ed.pct} onChange={e=>setEd({...ed,pct:e.target.value})} placeholder="30" style={{...inp,fontSize:16,fontWeight:700}}/></div>
               <div style={{flex:1}}><label style={lb}>開始日</label><input type="date" value={ed.startDate} onChange={e=>setEd({...ed,startDate:e.target.value})} style={inp}/></div>
             </div>
+            {(()=>{
+              const old=state.fields.find(x=>x.id===ed.id);
+              if(!old||old.startDate>today())return null;
+              const hist=getPctHist(old);
+              return (
+                <div style={{background:"rgba(255,255,255,0.02)",borderRadius:10,padding:"8px 12px",marginBottom:10,border:"1px solid rgba(255,255,255,0.05)"}}>
+                  {hist.length>1&&(
+                    <div style={{color:"rgba(255,255,255,0.3)",fontSize:10,marginBottom:6,lineHeight:1.7}}>
+                      割合の履歴: {hist.map(s=>`${fS(s.from)}〜 ${fmtPct(s.pct)}%`).join(" → ")}
+                    </div>
+                  )}
+                  <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",userSelect:"none"}}>
+                    <input type="checkbox" checked={!!ed.retroPct} onChange={e=>setEd({...ed,retroPct:e.target.checked})} style={{accentColor:"#fbbf24",width:14,height:14,cursor:"pointer",flexShrink:0}}/>
+                    <span style={{color:ed.retroPct?"#fbbf24":"rgba(255,255,255,0.4)",fontSize:11}}>割合を過去にさかのぼって適用（入力ミスの修正用）</span>
+                  </label>
+                  <div style={{color:"rgba(255,255,255,0.25)",fontSize:10,marginTop:4,lineHeight:1.6}}>
+                    {ed.retroPct
+                      ?"⚠️ 全期間の計画が書き直され、停止履歴も消えます。過去の遅れ/余剰の値が変わります。"
+                      :"割合の変更は今日から適用され、過去の計画は変わりません。一時的に休みたい場合は分野一覧の「⏸ 停止」を使ってください。開始日の変更は過去の計画を書き換えます。"}
+                  </div>
+                </div>
+              );
+            })()}
             {previewEnd&&(
               <div style={{background:"rgba(251,191,36,0.08)",borderRadius:10,padding:"10px 14px",marginBottom:14,border:"1px solid rgba(251,191,36,0.1)"}}>
                 <div style={{display:"flex",justifyContent:"space-between"}}><span style={{color:"rgba(255,255,255,0.5)",fontSize:12}}>📅 完了予定</span><span style={{color:"#fbbf24",fontSize:14,fontWeight:700}}>{fF(previewEnd)}</span></div>
@@ -1575,11 +1988,12 @@ function ChartTab({state}) {
           let latestD=t;Object.keys(state.logs).forEach(d=>{const arr=state.logs[d];if(Array.isArray(arr)&&arr.some(e=>e.fid===f.id)&&d>latestD)latestD=d;});
           let pln=0,d=f.startDate;while(d<=latestD&&pln<te){pln=Math.min(pln+fieldReq(f,d,segs),te);d=addD(d,1);}
           const diff=ae-pln;const dayReq=fieldReq(f,t,segs);const daysDiff=dayReq>0?(diff/dayReq):0;
+          const paused=!fieldComplete(f)&&isFieldPausedOn(f,t);
           return (
             <div key={f.id} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
               <div style={{width:6,height:6,borderRadius:"50%",background:CL[i%CL.length],flexShrink:0}}/>
-              <span style={{color:"rgba(255,255,255,0.6)",fontSize:12,flex:1}}>{f.name}</span>
-              <span style={{color:diff>=0?"#4ade80":"#f87171",fontSize:12,fontWeight:700,minWidth:70,textAlign:"right"}}>{diff>=0?"+":""}{diff.toFixed(0)}p ({daysDiff>=0?"+":""}{daysDiff.toFixed(1)}日)</span>
+              <span style={{color:"rgba(255,255,255,0.6)",fontSize:12,flex:1}}>{f.name}{paused&&<span style={{background:PAUSE_C+"22",color:PAUSE_C,fontSize:9,fontWeight:600,borderRadius:5,padding:"1px 6px",marginLeft:6}}>⏸ 停止中</span>}</span>
+              <span style={{color:diff>=0?"#4ade80":"#f87171",fontSize:12,fontWeight:700,minWidth:70,textAlign:"right"}}>{diff>=0?"+":""}{diff.toFixed(0)}p{dayReq>0?` (${daysDiff>=0?"+":""}${daysDiff.toFixed(1)}日)`:""}</span>
             </div>
           );
         })}
@@ -2234,11 +2648,11 @@ function DailyTab({state,persist}) {
         <div style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginTop:4,textAlign:"right"}}>{tAct.toFixed(1)} / {tReq.toFixed(1)} 実質p</div>
       </div>
 
-      {vdAlloc>100 && (
+      {vdAlloc>100.001 && (
         <div style={{...card,borderColor:"rgba(248,113,113,0.35)",background:"linear-gradient(135deg,#1f1419,#1a1f2e)"}}>
           <div style={{color:"#f87171",fontSize:13,fontWeight:600,marginBottom:4}}>⚠️ 割当が100%を超えています</div>
           <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.7}}>
-            {fF(vd)}の分野割当合計は <span style={{color:"#f87171",fontWeight:600}}>{vdAlloc}%</span> です。「計画入力」で各分野の割合を見直してください。
+            {fF(vd)}の分野割当合計は <span style={{color:"#f87171",fontWeight:600}}>{fmtPct(vdAlloc)}%</span> です。「計画入力」で各分野の割合を見直してください。
           </div>
         </div>
       )}
@@ -2285,7 +2699,7 @@ function DailyTab({state,persist}) {
               color:sf===f.id?CL[i%CL.length]:"rgba(255,255,255,0.5)",
               border:`1px solid ${sf===f.id?CL[i%CL.length]+"55":"rgba(255,255,255,0.08)"}`,
               borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",
-            }}>{f.name}</button>
+            }}>{!fieldComplete(f)&&isFieldPausedOn(f,vd)?"⏸ ":""}{f.name}</button>
           ))}
         </div>
         {selF&&(<>

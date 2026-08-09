@@ -5,10 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>勉強+瞑想+アイケア 計画トラッカー</title>
 <!--
+  v10 (2026-08-09): 「1日ノルマ」と「分野別ノルマの合計」が食い違う不具合を修正。
+  ・fieldActiveOn() を新設し、「その日その分野にノルマがあるか」の判定を1箇所に集約。
+    今日の記録の分野別 / 割当% / チャートの計画線 / 遅れ日数 がすべて同じ基準になった。
+    (旧: 割当%とチャートは完了予定日で打ち切るのに、今日の記録の分野別だけ打ち切らず、
+     割当が100%を超えていても警告が出ないまま分野別の合計だけがノルマを超えていた)
+  ・計画完了予定日を過ぎてもまだ読み終わっていない分野は、読了までノルマを出し続ける
+    (分野一覧に「⌛ 予定日超過」バッジ)。過去日の計画・割当は一切変更しない。
+  ・一時停止/再開の再配分候補を「その日ノルマが出る分野」に限定(開始前の分野が%を受け取る問題を修正)。
+    「100%に整える」ボタンと、合計が100%でないときの警告を追加。
+  ・今日の記録に、割当が100%でないときの説明カードを追加(100%未満も表示)。
+  ・GAS(google-apps-script-v6.js)側の変更は不要
+
   v9 (2026-07-17): 分野の一時停止(ペンディング)/再開機能を追加。
   ・分野の割合(%)は履歴管理(pctHist)になり、停止/再開/%変更は「指定日から適用」で過去の計画は凍結される
   ・停止中はノルマ0、完了予定日は停止期間ぶん自動で後ろへ(再開日未定の間は「再開日未定」表示)
-  ・GAS(google-apps-script-v6.js)側の変更は不要
 -->
 
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600;700&family=Shippori+Mincho:wght@400;500;600&display=swap" rel="stylesheet">
@@ -139,6 +150,30 @@ function lastPositivePct(f,date){
   return v;
 }
 function fieldReq(f, date, segs) { const p=fieldPctOn(f,date); if (!p || date < f.startDate) return 0; return dailyReq(date, segs) * (p / 100); }
+// ═══ その日その分野に「ノルマ(割当)があるか」の唯一の判定 ═══
+// この判定は 割当%・今日の記録の分野別・チャートの計画線・遅れ日数 のすべてで共有する。
+// 以前は場所ごとに条件がバラバラで(完了予定日で切る/切らない、完了分野を含む/含まない)、
+// 「1日ノルマ50なのに分野別の合計は66.7」のような食い違いが起きていた。
+//
+// ・過去日 … 当時の計画をそのまま返す(開始日〜計画完了予定日)。過去の計画は絶対に変えない。
+// ・今日以降 … 実際に読了/無効で完了した分野は対象外。
+//   計画完了予定日をすでに過ぎているのにまだ読み終わっていない分野は、
+//   読み終わるまで対象のまま残す(遅れている分野のノルマが消えないように)。
+//   逆に「これから計画完了予定日を迎える」分野は、その日を過ぎたら対象外(従来どおり)。
+function fieldActiveOn(f, date, segs, endMap) {
+  if (!f || date < f.startDate) return false;
+  if (fieldPctOn(f, date) <= 0) return false;
+  const end = endMap ? endMap.get(f.id) : fieldEnd(f, segs);
+  const t = today();
+  if (date >= t) {
+    if (fieldComplete(f)) return false;
+    if (end && date > end && end >= t) return false;
+    return true;
+  }
+  return !end || date <= end;
+}
+// その日その分野のノルマ(実質p)。fieldActiveOn を通したうえで値を返す。
+function fieldReqOn(f, date, segs, endMap) { return fieldActiveOn(f, date, segs, endMap) ? fieldReq(f, date, segs) : 0; }
 function bookEff(b) { const tp=b.disabled?Math.min(b.pagesRead||0,b.totalPages):b.totalPages; return tp*(b.coeff||1); }
 function fieldEff(f) { return f.books.reduce((s,b)=>s+bookEff(b),0); }
 function fieldEnd(f, segs) {
@@ -246,14 +281,7 @@ function fieldComplete(f) {
 // endMap(分野id→完了日)を渡すと fieldEnd の再計算を省略できる(日ループでの性能対策)
 function getAllocOnDate(fields, date, segs, endMap) {
   let total = 0;
-  fields.forEach(f => {
-    if (date < f.startDate) return;
-    const p = fieldPctOn(f, date);
-    if (!p) return;
-    const end = endMap ? endMap.get(f.id) : fieldEnd(f, segs);
-    if (end && date > end) return;
-    total += p;
-  });
+  fields.forEach(f => { if (fieldActiveOn(f, date, segs, endMap)) total += fieldPctOn(f, date); });
   return Math.round(total * 1000) / 1000; // 浮動小数の誤差を除去
 }
 
@@ -269,6 +297,8 @@ function allocScanEnd(fields, endMap, extraDays) {
   let maxEnd = GS;
   endMap.forEach(e => { if (e && e > maxEnd) maxEnd = e; });
   fields.forEach(f => getPctHist(f).forEach(s => { if (s.from > maxEnd) maxEnd = s.from; }));
+  // 全分野が完了予定日を過ぎている場合でも、今日以降の割当は必ず検査する
+  const t = today(); if (maxEnd < t) maxEnd = t;
   return addD(maxEnd, extraDays);
 }
 
@@ -780,10 +810,7 @@ function buildDailyCompare(state, ff, halfWeeks, offsetDays=0) {
   for(let i=0;i<totalDays;i++){
     const d=addD(startD,i);
     let dp=0;
-    af.forEach(f=>{
-      const end=endMap.get(f.id);
-      if(!end||d<=end) dp+=fieldReq(f,d,segs); // fieldReqが日付ごとの割合(停止含む)を反映
-    });
+    af.forEach(f=>{ dp+=fieldReqOn(f,d,segs,endMap); }); // 割合(停止含む)と有効期間は fieldActiveOn に集約
     dp=Math.round(dp*10)/10;
     let da=0;
     const ents=Array.isArray(logs[d])?logs[d]:[];
@@ -812,10 +839,7 @@ function buildPlanActualChart(state, halfWeeks, offsetDays=0) {
     const segments=[];
     if(isFuture){
       fields.forEach((f,fi)=>{
-        const end=endMap.get(f.id);
-        let val=0;
-        if(!end||d<=end) val=fieldReq(f,d,segs); // fieldReqが日付ごとの割合(停止含む)を反映
-        segments.push({fid:f.id,val,color:CL[fi%CL.length],dashed:true});
+        segments.push({fid:f.id,val:fieldReqOn(f,d,segs,endMap),color:CL[fi%CL.length],dashed:true});
       });
     } else {
       fields.forEach((f,fi)=>{
@@ -906,7 +930,9 @@ function calcCum(state, ff) {
   }
   let cumP=0; cumPF.forEach(v=>cumP+=v);
   const pageDiff=cumA-cumP;
-  const todayReq=af.reduce((s,f)=>s+(fieldComplete(f)?0:fieldReq(f,t,segs)),0);
+  // 遅れ/余剰の日数換算に使う「今日のノルマ」も他タブと同じ判定にそろえる
+  const endMapC=buildEndMap(af,segs);
+  const todayReq=af.reduce((s,f)=>s+fieldReqOn(f,t,segs,endMapC),0);
   const daysDiff=todayReq>0?pageDiff/todayReq:0;
   return {pageDiff:Math.round(pageDiff*10)/10,daysDiff:Math.round(daysDiff*10)/10,cumPlan:Math.round(cumP),cumActual:Math.round(cumA)};
 }
@@ -1156,9 +1182,18 @@ function calcEndChanges(oldFields,newFields,targets,segs){
 function allocTotalLine(total){
   const ok=Math.abs(total-100)<0.05;
   return (
-    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0 2px"}}>
-      <span style={{color:"rgba(255,255,255,0.4)",fontSize:11}}>割当合計（対象分野）</span>
-      <span style={{color:ok?"#4ade80":total>100?"#f87171":"#fbbf24",fontSize:14,fontWeight:700}}>{fmtPct(total)}%</span>
+    <div style={{padding:"8px 0 2px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span style={{color:"rgba(255,255,255,0.4)",fontSize:11}}>割当合計（対象分野）</span>
+        <span style={{color:ok?"#4ade80":total>100?"#f87171":"#fbbf24",fontSize:14,fontWeight:700}}>{fmtPct(total)}%</span>
+      </div>
+      {!ok&&(
+        <div style={{color:total>100?"#f87171":"#fbbf24",fontSize:10,lineHeight:1.6,marginTop:4}}>
+          {total>100
+            ?"⚠️ 合計が100%を超えています。このまま適用すると、分野別ノルマの合計が1日ノルマを超えます。"
+            :"⚠️ 合計が100%未満です。このまま適用すると、1日ノルマの一部がどの分野にも割り当てられません。"}
+        </div>
+      )}
     </div>
   );
 }
@@ -1173,13 +1208,26 @@ function PauseFieldModal({state,segs,field,onClose,onApply}){
   const [err,setErr]=useState("");
   const D=(fromDate&&!isNaN(parseD(fromDate).getTime()))?fromDate:t;
   const freed=fieldPctOn(field,D);
-  const candidates=useMemo(()=>state.fields.filter(f=>f.id!==field.id&&!fieldComplete(f)&&fieldPctOn(f,D)>0),[state.fields,field.id,D]);
+  const endMap=useMemo(()=>buildEndMap(state.fields,segs),[state.fields,segs]);
+  // 再配分の候補は「その日に実際にノルマが出る分野」だけ。
+  // まだ開始していない分野(開始日が先)を混ぜると、その日は使われない%が配られて
+  // 合計が100%を超えた状態になる(電源のように開始前の分野が受け取ってしまう問題)。
+  const candidates=useMemo(()=>state.fields.filter(f=>f.id!==field.id&&fieldActiveOn(f,D,segs,endMap)),[state.fields,field.id,D,segs,endMap]);
   const sumOthers=candidates.reduce((s,f)=>s+fieldPctOn(f,D),0);
   const setProportional=()=>{
     const m={};candidates.forEach(f=>{const cur=fieldPctOn(f,D);m[f.id]=fmtPct(sumOthers>0?cur+freed*cur/sumOthers:cur);});setDist(m);
   };
   const setKeep=()=>{
     const m={};candidates.forEach(f=>{m[f.id]=fmtPct(fieldPctOn(f,D));});setDist(m);
+  };
+  // 現在の配分がすでに100%からずれている場合の立て直し用。合計がちょうど100%になる。
+  const setNormalize=()=>{
+    const m={};
+    if(candidates.length){
+      if(sumOthers>0) candidates.forEach(f=>{m[f.id]=fmtPct(fieldPctOn(f,D)*100/sumOthers);});
+      else candidates.forEach(f=>{m[f.id]=fmtPct(100/candidates.length);});
+    }
+    setDist(m);
   };
   useEffect(()=>{setProportional();},[D,field.id]);
   const targets=useMemo(()=>{
@@ -1218,6 +1266,7 @@ function PauseFieldModal({state,segs,field,onClose,onApply}){
             <span style={{color:"rgba(255,255,255,0.6)",fontSize:12,fontWeight:600}}>空いた {fmtPct(freed)}% の再配分</span>
             <div style={{display:"flex",gap:6}}>
               <button onClick={setProportional} style={{background:"rgba(251,191,36,0.12)",color:"#fbbf24",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>比例配分</button>
+              <button onClick={setNormalize} style={{background:"rgba(74,222,128,0.12)",color:"#4ade80",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>100%に整える</button>
               <button onClick={setKeep} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>配分しない</button>
             </div>
           </div>
@@ -1254,7 +1303,9 @@ function ResumeFieldModal({state,segs,field,onClose,onApply}){
   const D=(fromDate&&!isNaN(parseD(fromDate).getTime()))?fromDate:t;
   const snap=(field.pause&&field.pause.snapshot)||null;
   const since=(field.pause&&field.pause.since)||null;
-  const others=useMemo(()=>state.fields.filter(f=>f.id!==field.id&&!fieldComplete(f)&&fieldPctOn(f,D)>0),[state.fields,field.id,D]);
+  const endMap=useMemo(()=>buildEndMap(state.fields,segs),[state.fields,segs]);
+  // 停止モーダルと同じく「その日ノルマが出る分野」だけを対象にする
+  const others=useMemo(()=>state.fields.filter(f=>f.id!==field.id&&fieldActiveOn(f,D,segs,endMap)),[state.fields,field.id,D,segs,endMap]);
   const selfDefault=(snap&&snap[field.id]>0)?snap[field.id]:lastPositivePct(field,D);
   const setFromSnap=()=>{
     const m={};m[field.id]=fmtPct(selfDefault);
@@ -1264,6 +1315,19 @@ function ResumeFieldModal({state,segs,field,onClose,onApply}){
   const setCurrent=()=>{
     const m={};m[field.id]=fmtPct(selfDefault);
     others.forEach(f=>{m[f.id]=fmtPct(fieldPctOn(f,D));});
+    setVals(m);
+  };
+  // 再開後の合計がちょうど100%になるよう、現在の比率のまま全体を伸縮させる
+  const setNormalize=()=>{
+    const base=selfDefault+others.reduce((s,f)=>s+fieldPctOn(f,D),0);
+    const m={};
+    if(base>0){
+      m[field.id]=fmtPct(selfDefault*100/base);
+      others.forEach(f=>{m[f.id]=fmtPct(fieldPctOn(f,D)*100/base);});
+    }else{
+      const ea=100/(others.length+1);
+      m[field.id]=fmtPct(ea);others.forEach(f=>{m[f.id]=fmtPct(ea);});
+    }
     setVals(m);
   };
   useEffect(()=>{setFromSnap();},[field.id]);
@@ -1301,6 +1365,7 @@ function ResumeFieldModal({state,segs,field,onClose,onApply}){
             <span style={{color:"rgba(255,255,255,0.6)",fontSize:12,fontWeight:600}}>再開後の配分</span>
             <div style={{display:"flex",gap:6}}>
               {snap&&<button onClick={setFromSnap} style={{background:"rgba(74,222,128,0.12)",color:"#4ade80",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>停止前に戻す</button>}
+              <button onClick={setNormalize} style={{background:"rgba(74,222,128,0.12)",color:"#4ade80",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>100%に整える</button>
               <button onClick={setCurrent} style={{background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.5)",border:"none",borderRadius:7,padding:"4px 10px",fontSize:10,fontWeight:600,cursor:"pointer"}}>他は現状維持</button>
             </div>
           </div>
@@ -1568,6 +1633,8 @@ function PlanTab({state,persist}) {
           const paused=!done&&isFieldPausedOn(f,t);
           const since=(f.pause&&f.pause.since)||null;
           const until=(f.pause&&f.pause.until&&f.pause.until>t)?f.pause.until:null;
+          // 計画完了予定日を過ぎたのにまだ読み終わっていない状態(ノルマは読了まで継続する)
+          const overdue=!done&&!paused&&!!end&&end<t;
           return (
             <div key={f.id} style={{background:done?"rgba(255,255,255,0.015)":"rgba(255,255,255,0.03)",borderRadius:12,padding:"12px 16px",marginBottom:8,border:`1px solid ${paused?PAUSE_C+"44":col+(done?"14":"22")}`,opacity:done?0.5:1}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
@@ -1578,9 +1645,10 @@ function PlanTab({state,persist}) {
                     <span style={{color:paused?PAUSE_C:col,fontSize:12,fontWeight:700}}>{fmtPct(curP)}%</span>
                     {done&&<span style={{color:"#4ade80",fontSize:10,fontWeight:600,marginLeft:2}}>✓ 完了</span>}
                     {paused&&<span style={{background:PAUSE_C+"22",color:PAUSE_C,fontSize:10,fontWeight:600,borderRadius:6,padding:"1px 7px"}}>⏸ 停止中{since?` ${fS(since)}〜`:""}{until?fS(until):""}</span>}
+                    {overdue&&<span style={{background:"rgba(248,113,113,0.14)",color:"#f87171",fontSize:10,fontWeight:600,borderRadius:6,padding:"1px 7px"}}>⌛ 予定日超過</span>}
                   </div>
                   <div style={{color:"rgba(255,255,255,0.3)",fontSize:11,marginTop:3,marginLeft:16}}>
-                    {fF(f.startDate)}〜{end?fF(end):(paused?"（再開日未定）":"")} · {f.books.length}冊 · 実質{te.toFixed(0)}p
+                    {fF(f.startDate)}〜{end?fF(end):(paused?"（再開日未定）":"")}{overdue?"（超過中・読了までノルマ継続）":""} · {f.books.length}冊 · 実質{te.toFixed(0)}p
                   </div>
                 </div>
                 <div style={{display:"flex",gap:6,flexShrink:0}}>
@@ -1836,6 +1904,7 @@ function ChartTab({state}) {
 
   const segs=useMemo(()=>getSegs(state),[state]);
   const medSegs=useMemo(()=>getMedSegs(state),[state]);
+  const endMap=useMemo(()=>buildEndMap(state.fields,segs),[state.fields,segs]);
 
   const compareData=useMemo(()=>buildDailyCompare(state,ff,hw,offsetDays),[state,ff,hw,offsetDays]);
   const paData=useMemo(()=>buildPlanActualChart(state,hw,offsetDays),[state,hw,offsetDays]);
@@ -1987,7 +2056,7 @@ function ChartTab({state}) {
           const te=fieldEff(f);const ae=logsEff(f,state.logs);
           let latestD=t;Object.keys(state.logs).forEach(d=>{const arr=state.logs[d];if(Array.isArray(arr)&&arr.some(e=>e.fid===f.id)&&d>latestD)latestD=d;});
           let pln=0,d=f.startDate;while(d<=latestD&&pln<te){pln=Math.min(pln+fieldReq(f,d,segs),te);d=addD(d,1);}
-          const diff=ae-pln;const dayReq=fieldReq(f,t,segs);const daysDiff=dayReq>0?(diff/dayReq):0;
+          const diff=ae-pln;const dayReq=fieldReqOn(f,t,segs,endMap);const daysDiff=dayReq>0?(diff/dayReq):0;
           const paused=!fieldComplete(f)&&isFieldPausedOn(f,t);
           return (
             <div key={f.id} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
@@ -2583,11 +2652,13 @@ function DailyTab({state,persist}) {
   const reset=()=>{setSb(null);setPg("");setEi(null);};
   const go=(d)=>{setVd(d);reset();};
   const dReq=dailyReq(vd,segs);
-  const vdAlloc=useMemo(()=>getAllocOnDate(state.fields, vd, segs),[state.fields,segs,vd]);
+  const endMap=useMemo(()=>buildEndMap(state.fields,segs),[state.fields,segs]);
+  const vdAlloc=useMemo(()=>getAllocOnDate(state.fields, vd, segs, endMap),[state.fields,segs,vd,endMap]);
   const dl=Array.isArray(state.logs[vd])?state.logs[vd]:[];
   const fs=state.fields.map(f=>{
     const done=fieldComplete(f);
-    const req=done?0:fieldReq(f,vd,segs);
+    // 有効判定は fieldActiveOn に集約(割当%・チャートと同じ基準)
+    const req=fieldReqOn(f,vd,segs,endMap);
     let act=0;
     dl.forEach(e=>{if(e.fid!==f.id)return;const b=f.books.find(x=>x.id===e.bid);if(b)act+=e.pg*(b.coeff||1);});
     return {f,req,act,done};
@@ -2596,6 +2667,8 @@ function DailyTab({state,persist}) {
   const targetFs=fs.filter(x=>x.req>0);
   const tReq=fs.reduce((s,x)=>s+x.req,0);const tAct=fs.reduce((s,x)=>s+x.act,0);
   const pct=tReq>0?Math.min(tAct/tReq*100,100):0;
+  // 割当が100%でない = 分野別の合計と1日ノルマが食い違う。その場で理由を出す。
+  const allocOff=vdAlloc>0.001&&Math.abs(vdAlloc-100)>0.05&&dReq>0;
 
   function saveLog(){
     const p=parseInt(pg);if(!sf||!sb||!p||p<=0)return;
@@ -2645,14 +2718,18 @@ function DailyTab({state,persist}) {
           </div>
           <span style={{color:pct>=100?"#4ade80":"#fff",fontSize:14,fontWeight:700}}>{pct.toFixed(0)}%</span>
         </div>
-        <div style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginTop:4,textAlign:"right"}}>{tAct.toFixed(1)} / {tReq.toFixed(1)} 実質p</div>
+        <div style={{color:"rgba(255,255,255,0.25)",fontSize:11,marginTop:4,textAlign:"right"}}>{tAct.toFixed(1)} / {tReq.toFixed(1)} 実質p<span style={{marginLeft:6,opacity:0.7}}>(分野別の合計)</span></div>
       </div>
 
-      {vdAlloc>100.001 && (
-        <div style={{...card,borderColor:"rgba(248,113,113,0.35)",background:"linear-gradient(135deg,#1f1419,#1a1f2e)"}}>
-          <div style={{color:"#f87171",fontSize:13,fontWeight:600,marginBottom:4}}>⚠️ 割当が100%を超えています</div>
+      {allocOff && (
+        <div style={{...card,borderColor:vdAlloc>100?"rgba(248,113,113,0.35)":"rgba(251,191,36,0.3)",background:vdAlloc>100?"linear-gradient(135deg,#1f1419,#1a1f2e)":"linear-gradient(135deg,#1f1a14,#1a1f2e)"}}>
+          <div style={{color:vdAlloc>100?"#f87171":"#fbbf24",fontSize:13,fontWeight:600,marginBottom:4}}>
+            {vdAlloc>100?"⚠️ 割当が100%を超えています":"📢 割当が100%に達していません"}
+          </div>
           <div style={{color:"rgba(255,255,255,0.4)",fontSize:11,lineHeight:1.7}}>
-            {fF(vd)}の分野割当合計は <span style={{color:"#f87171",fontWeight:600}}>{fmtPct(vdAlloc)}%</span> です。「計画入力」で各分野の割合を見直してください。
+            {fF(vd)}の分野割当合計は <span style={{color:vdAlloc>100?"#f87171":"#fbbf24",fontWeight:600}}>{fmtPct(vdAlloc)}%</span> です。
+            そのため分野別の合計 <span style={{color:"#fff",fontWeight:600}}>{tReq.toFixed(1)}</span> 実質p が、1日ノルマ <span style={{color:"#fff",fontWeight:600}}>{dReq.toFixed(1)}</span> 実質p と一致していません。<br/>
+            「計画入力」の分野一覧で各分野の割合を見直してください。
           </div>
         </div>
       )}
